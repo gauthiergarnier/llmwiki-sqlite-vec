@@ -57,7 +57,7 @@ async def create_pool(db_path: str) -> aiosqlite.Connection:
     await db.load_extension(sqlite_vec.loadable_path())
     await db.enable_load_extension(False)
     await db.execute("PRAGMA journal_mode=WAL")
-    await db.execute("PRAGMA busy_timeout=5000")
+    await db.execute("PRAGMA busy_timeout=30000")
     await db.execute("PRAGMA foreign_keys=ON")
     schema = _SCHEMA_PATH.read_text()
     await db.executescript(schema)
@@ -358,6 +358,8 @@ class SQLiteChunkRepository:
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             chunk_rows,
         )
+        await self._db.commit()
+        logger.info("Stored %d chunks for doc %s", len(chunks), doc_id[:8])
 
         try:
             from embedder import embed_texts, serialize_embedding
@@ -367,11 +369,9 @@ class SQLiteChunkRepository:
                 "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
                 [(row[0], serialize_embedding(emb)) for row, emb in zip(chunk_rows, embeddings)],
             )
+            await self._db.commit()
         except Exception:
             logger.warning("Failed to generate embeddings for doc %s — vector search unavailable for these chunks", doc_id[:8], exc_info=True)
-
-        await self._db.commit()
-        logger.info("Stored %d chunks for doc %s", len(chunks), doc_id[:8])
 
     async def search_fulltext(
         self, kb_id: str, query: str, *, limit: int = 20,

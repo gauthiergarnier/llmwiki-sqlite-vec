@@ -2,7 +2,7 @@
 -- This is derived state — deletable and rebuildable from the workspace filesystem.
 
 PRAGMA journal_mode=WAL;
-PRAGMA busy_timeout=5000;
+PRAGMA busy_timeout=30000;
 PRAGMA foreign_keys=ON;
 
 CREATE TABLE IF NOT EXISTS workspace (

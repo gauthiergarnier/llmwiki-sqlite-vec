@@ -119,6 +119,7 @@ async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> 
             (chunk_id, doc_id, c.index, c.content, c.page,
              c.start_char, c.token_count, c.header_breadcrumb),
         )
+    await db.commit()
 
     try:
         from embedder import embed_texts, serialize_embedding
@@ -129,6 +130,7 @@ async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> 
                 "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
                 (chunk_id, serialize_embedding(emb)),
             )
+        await db.commit()
     except Exception:
         logger.warning("Failed to generate embeddings for doc %s", doc_id[:8], exc_info=True)
 
