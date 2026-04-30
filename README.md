@@ -10,6 +10,39 @@ Point it at a folder, start the local app, and connect Claude over MCP. From the
 
 ![LLM Wiki — a compiled wiki page with citations and table of contents](wiki-page.png)
 
+## Why we made these changes
+
+The original LLM Wiki searches your documents the same way a book index works: it looks for the exact words you typed. If your notes say "machine learning" but you search for "AI", nothing comes back. This is called **keyword search**, and while it's fast and reliable for precise terms, it has a fundamental blind spot — it doesn't understand what words *mean*.
+
+This fork fixes that by adding a second search engine that works more like your brain does. Here's the idea in plain terms:
+
+### What changed
+
+When you add a document to the wiki, the system now does two things instead of one:
+
+1. **Before (keyword index only):** The text is broken into chunks and added to a word-based index. Searching for "cat" finds documents containing the word "cat" — but not "feline", "kitten", or "pet".
+
+2. **Now (keyword + meaning):** Each chunk is also run through a small AI model that lives on your machine. This model converts the text into a list of 384 numbers (a "vector") that captures its meaning. Similar ideas end up with similar numbers, even if they use completely different words.
+
+At search time, both engines run in parallel. Their results are merged using a scoring method called Reciprocal Rank Fusion — a document that scores well on *both* keyword match and meaning match rises to the top.
+
+### What this means for you
+
+- **Search with natural language.** Ask "what are the risks of scaling?" and find chunks about "growth challenges", "bottlenecks", and "capacity limits" — even if none of those chunks contain the word "risk" or "scaling".
+- **Claude finds better sources.** When Claude searches your wiki to write or update pages, it retrieves more relevant material. Better retrieval means better-written pages with fewer gaps.
+- **Nothing breaks.** If you search for an exact filename or a specific technical term, keyword search still handles that perfectly. The two approaches complement each other.
+- **Everything stays local.** The AI model (~80MB) runs on your machine. No documents leave your computer, no API keys needed, no cloud dependency.
+
+### What we changed under the hood
+
+| Component | What changed |
+|-----------|-------------|
+| **Document ingestion** | Each text chunk now gets an embedding vector stored alongside it in a new `chunk_vec` table (powered by sqlite-vec) |
+| **Search** | Queries run against both FTS5 (keywords) and vec0 (vectors), results merged via RRF |
+| **Startup** | First launch downloads the embedding model and backfills vectors for any existing chunks |
+| **Dependencies** | Added `sqlite-vec` (vector storage) and `sentence-transformers` (embedding model) |
+| **Fallback** | If the embedding model isn't available, search degrades gracefully to keyword-only — the same behavior as before this fork |
+
 ## What actually happens
 
 1. **You have a folder** — PDFs, notes, articles, spreadsheets. Your existing research.
