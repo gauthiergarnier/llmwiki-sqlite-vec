@@ -10,6 +10,7 @@ venv/
 .next/
 dist/
 *.egg-info/
+tsconfig.tsbuildinfo
 
 # Secrets — NEVER commit
 .env
