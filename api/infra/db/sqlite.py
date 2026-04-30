@@ -6,10 +6,15 @@ All queries use native SQLite syntax — no translation layer.
 
 import json
 import logging
+import sys
 import uuid
 from pathlib import Path
 
 import aiosqlite
+import sqlite_vec
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "shared"))
+from embedder import EMBEDDING_DIM
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +53,18 @@ def _row_to_dict(cursor: aiosqlite.Cursor, row: tuple) -> dict:
 async def create_pool(db_path: str) -> aiosqlite.Connection:
     db = await aiosqlite.connect(db_path)
     db.row_factory = None
+    await db.enable_load_extension(True)
+    await db.load_extension(sqlite_vec.loadable_path())
+    await db.enable_load_extension(False)
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
     schema = _SCHEMA_PATH.read_text()
     await db.executescript(schema)
+    await db.commit()
+    await db.execute(
+        f"CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0("
+        f"chunk_id text primary key, embedding float[{EMBEDDING_DIM}])"
+    )
     await db.commit()
     return db
 
@@ -323,21 +336,39 @@ class SQLiteChunkRepository:
         self._db = db
 
     async def store(self, doc_id: str, user_id: str, kb_id: str, chunks: list) -> None:
+        await self._db.execute(
+            "DELETE FROM chunk_vec WHERE chunk_id IN "
+            "(SELECT id FROM document_chunks WHERE document_id = ?)",
+            (doc_id,),
+        )
         await self._db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
         if not chunks:
             await self._db.commit()
             return
 
+        chunk_rows = [
+            (str(uuid.uuid4()), doc_id, c.index, c.content, c.page,
+             c.start_char, c.token_count, c.header_breadcrumb)
+            for c in chunks
+        ]
         await self._db.executemany(
             "INSERT INTO document_chunks "
             "(id, document_id, chunk_index, content, page, start_char, token_count, header_breadcrumb) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (str(uuid.uuid4()), doc_id, c.index, c.content, c.page,
-                 c.start_char, c.token_count, c.header_breadcrumb)
-                for c in chunks
-            ],
+            chunk_rows,
         )
+
+        try:
+            from embedder import embed_texts, serialize_embedding
+            texts = [c.content for c in chunks]
+            embeddings = embed_texts(texts)
+            await self._db.executemany(
+                "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+                [(row[0], serialize_embedding(emb)) for row, emb in zip(chunk_rows, embeddings)],
+            )
+        except Exception:
+            logger.warning("Failed to generate embeddings for doc %s — vector search unavailable for these chunks", doc_id[:8], exc_info=True)
+
         await self._db.commit()
         logger.info("Stored %d chunks for doc %s", len(chunks), doc_id[:8])
 

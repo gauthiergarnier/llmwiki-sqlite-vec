@@ -17,4 +17,6 @@ beautifulsoup4==4.13.4
 lxml==6.1.0
 opendataloader-pdf==2.3.0
 aiosqlite==0.21.0
+sqlite-vec>=0.1.6
+sentence-transformers>=3.0.0
 watchfiles==1.1.0

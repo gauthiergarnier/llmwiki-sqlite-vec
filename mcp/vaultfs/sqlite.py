@@ -3,10 +3,15 @@
 import json
 import logging
 import os
+import sys
 import uuid
 from pathlib import Path
 
 import aiosqlite
+import sqlite_vec
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "shared"))
+from embedder import EMBEDDING_DIM
 
 from .base import VaultFS
 
@@ -37,6 +42,73 @@ def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
     return results
 
 
+def _rrf_combine(fts_results: list[dict], vec_results: list[dict], limit: int, k: int = 60) -> list[dict]:
+    """Reciprocal Rank Fusion: merge FTS5 and vector results with equal weight."""
+    scores: dict[tuple, float] = {}
+    result_map: dict[tuple, dict] = {}
+
+    for rank, r in enumerate(fts_results):
+        key = (r["path"], r["filename"], r["chunk_index"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        result_map[key] = r
+
+    for rank, r in enumerate(vec_results):
+        key = (r["path"], r["filename"], r["chunk_index"])
+        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
+        if key not in result_map:
+            result_map[key] = r
+
+    sorted_keys = sorted(scores, key=lambda x: scores[x], reverse=True)
+    results = []
+    for key in sorted_keys[:limit]:
+        result = dict(result_map[key])
+        result["score"] = scores[key]
+        results.append(result)
+    return results
+
+
+_BACKFILL_BATCH = 64
+
+
+async def _backfill_embeddings(db: aiosqlite.Connection) -> None:
+    """Backfill embeddings for any chunks missing from chunk_vec."""
+    cursor = await db.execute("SELECT count(*) FROM document_chunks")
+    total = (await cursor.fetchone())[0]
+    if total == 0:
+        return
+    cursor = await db.execute("SELECT count(*) FROM chunk_vec")
+    embedded = (await cursor.fetchone())[0]
+    if embedded >= total:
+        return
+
+    missing = total - embedded
+    logger.info("Backfilling %d chunk embeddings...", missing)
+
+    try:
+        from embedder import embed_texts, serialize_embedding
+    except Exception:
+        logger.warning("Cannot backfill embeddings — embedding model unavailable")
+        return
+
+    cursor = await db.execute(
+        "SELECT id, content FROM document_chunks "
+        "WHERE id NOT IN (SELECT chunk_id FROM chunk_vec)"
+    )
+    rows = await cursor.fetchall()
+
+    for i in range(0, len(rows), _BACKFILL_BATCH):
+        batch = rows[i:i + _BACKFILL_BATCH]
+        ids = [r[0] for r in batch]
+        texts = [r[1] for r in batch]
+        embeddings = embed_texts(texts)
+        await db.executemany(
+            "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+            [(cid, serialize_embedding(emb)) for cid, emb in zip(ids, embeddings)],
+        )
+    await db.commit()
+    logger.info("Backfilled %d chunk embeddings", len(rows))
+
+
 class SqliteVaultFS(VaultFS):
     """SQLite + local filesystem vault."""
 
@@ -52,12 +124,21 @@ class SqliteVaultFS(VaultFS):
         db_path = os.path.join(workspace_path, ".llmwiki", "index.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         _db = await aiosqlite.connect(db_path)
+        await _db.enable_load_extension(True)
+        await _db.load_extension(sqlite_vec.loadable_path())
+        await _db.enable_load_extension(False)
         await _db.execute("PRAGMA journal_mode=WAL")
         await _db.execute("PRAGMA foreign_keys=ON")
         if _SCHEMA_PATH.exists():
             await _db.executescript(_SCHEMA_PATH.read_text())
             await _db.commit()
-        logger.info("SQLite initialized: %s", db_path)
+        await _db.execute(
+            f"CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0("
+            f"chunk_id text primary key, embedding float[{EMBEDDING_DIM}])"
+        )
+        await _db.commit()
+        await _backfill_embeddings(_db)
+        logger.info("SQLite initialized (with sqlite-vec): %s", db_path)
 
     @staticmethod
     async def close() -> None:
@@ -214,6 +295,27 @@ class SqliteVaultFS(VaultFS):
 
     async def search_chunks(self, kb_id: str, query: str, limit: int, path_filter: str | None = None) -> list[dict]:
         db = self._db_or_raise()
+        fetch_limit = limit * 3
+
+        try:
+            fts_results = await self._search_fts(db, query, fetch_limit, path_filter)
+        except Exception:
+            logger.warning("FTS5 search failed for query: %s", query, exc_info=True)
+            fts_results = []
+
+        try:
+            vec_results = await self._search_vec(db, query, fetch_limit, path_filter)
+        except Exception:
+            logger.debug("Vector search unavailable", exc_info=True)
+            vec_results = []
+
+        if not vec_results:
+            return fts_results[:limit]
+        if not fts_results:
+            return vec_results[:limit]
+        return _rrf_combine(fts_results, vec_results, limit)
+
+    async def _search_fts(self, db, query: str, limit: int, path_filter: str | None) -> list[dict]:
         sql = (
             "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
             "d.filename, d.title, d.path, d.file_type, d.tags, "
@@ -230,6 +332,29 @@ class SqliteVaultFS(VaultFS):
             sql += "AND d.source_kind != 'wiki' "
         sql += "ORDER BY rank LIMIT ?"
         params.append(limit)
+        cursor = await db.execute(sql, params)
+        return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def _search_vec(self, db, query: str, limit: int, path_filter: str | None) -> list[dict]:
+        from embedder import embed_query, serialize_embedding
+        query_emb = serialize_embedding(embed_query(query))
+
+        sql = (
+            "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, "
+            "sub.distance as score "
+            "FROM (SELECT chunk_id, distance FROM chunk_vec "
+            "      WHERE embedding MATCH ? AND k = ?) sub "
+            "JOIN document_chunks dc ON dc.id = sub.chunk_id "
+            "JOIN documents d ON dc.document_id = d.id "
+            "WHERE d.status != 'failed' "
+        )
+        params: list = [query_emb, limit]
+        if path_filter == "wiki":
+            sql += "AND d.source_kind = 'wiki' "
+        elif path_filter == "sources":
+            sql += "AND d.source_kind != 'wiki' "
+        sql += "ORDER BY sub.distance"
 
         cursor = await db.execute(sql, params)
         return _rows_to_dicts(cursor, await cursor.fetchall())

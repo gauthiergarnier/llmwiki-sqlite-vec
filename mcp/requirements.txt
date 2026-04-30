@@ -8,3 +8,5 @@ logfire[asyncpg]==4.25.0
 aioboto3==14.3.0
 sentry-sdk==2.29.1
 aiosqlite==0.21.0
+sqlite-vec>=0.1.6
+sentence-transformers>=3.0.0

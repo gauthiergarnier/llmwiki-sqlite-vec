@@ -9,11 +9,14 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import tempfile
 import uuid
 from pathlib import Path
 
 import aiosqlite
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / "shared"))
 
 from config import settings
 
@@ -94,15 +97,40 @@ async def process_document(db: aiosqlite.Connection, doc_id: str, workspace: Pat
 
 
 async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> None:
-    """Store chunks into SQLite, replacing any existing ones."""
+    """Store chunks into SQLite, replacing any existing ones, with embeddings."""
+    await db.execute(
+        "DELETE FROM chunk_vec WHERE chunk_id IN "
+        "(SELECT id FROM document_chunks WHERE document_id = ?)",
+        (doc_id,),
+    )
     await db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
+
+    if not chunks:
+        return
+
+    chunk_rows = []
     for c in chunks:
+        chunk_id = str(uuid.uuid4())
+        chunk_rows.append((chunk_id, doc_id, c.index, c.content, c.page,
+                           c.start_char, c.token_count, c.header_breadcrumb))
         await db.execute(
             "INSERT INTO document_chunks (id, document_id, chunk_index, content, page, "
             "start_char, token_count, header_breadcrumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, c.index, c.content, c.page,
+            (chunk_id, doc_id, c.index, c.content, c.page,
              c.start_char, c.token_count, c.header_breadcrumb),
         )
+
+    try:
+        from embedder import embed_texts, serialize_embedding
+        texts = [c.content for c in chunks]
+        embeddings = embed_texts(texts)
+        for (chunk_id, *_), emb in zip(chunk_rows, embeddings):
+            await db.execute(
+                "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, serialize_embedding(emb)),
+            )
+    except Exception:
+        logger.warning("Failed to generate embeddings for doc %s", doc_id[:8], exc_info=True)
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────

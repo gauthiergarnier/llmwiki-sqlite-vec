@@ -1,10 +1,10 @@
-# LLM Wiki
+# LLM Wiki + sqlite-vec
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](https://opensource.org/licenses/Apache-2.0)
 
-Open-source implementation of [Karpathy's LLM Wiki](https://x.com/karpathy/status/2039805659525644595) ([spec](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)).
+Fork of [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki) that adds **hybrid semantic search** to the local SQLite backend using [sqlite-vec](https://github.com/asg017/sqlite-vec).
 
-I built this because research folders accumulate useful material faster than I can keep summaries, links, and citations current by hand. LLM Wiki offloads that editing work to Claude so I can focus on source selection and analysis instead.
+The original LLM Wiki uses SQLite FTS5 (porter stemming) for keyword-only search in local mode. This fork adds vector embeddings via `all-MiniLM-L6-v2` and combines both signals using Reciprocal Rank Fusion (RRF), so search finds results by meaning — not just matching keywords.
 
 Point it at a folder, start the local app, and connect Claude over MCP. From there, Claude reads your sources, writes wiki pages, and keeps links and citations in sync.
 
@@ -19,16 +19,15 @@ Point it at a folder, start the local app, and connect Claude over MCP. From the
 
 ## Quick Start
 
-**Requirements:** Python 3.11+, Node.js 20+
+**Requirements:** Python 3.11–3.13, Node.js 20+
 
 ```bash
-git clone https://github.com/lucasastorian/llmwiki.git
-cd llmwiki
+git clone https://github.com/gauthiergarnier/llmwiki-sqlite-vec.git
+cd llmwiki-sqlite-vec
 
-# Install Python deps
-cd api && python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cd ..
+# Install Python deps (single venv for both api and mcp)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r api/requirements.txt -r mcp/requirements.txt
 
 # Install web deps
 cd web && npm install && cd ..
@@ -39,6 +38,8 @@ cd web && npm install && cd ..
 # Start the app
 ./llmwiki serve ~/research
 ```
+
+On first startup, the embedding model (`all-MiniLM-L6-v2`, ~80MB) is downloaded automatically, and any existing chunks are backfilled with embeddings. This is a one-time cost.
 
 Open [localhost:3000](http://localhost:3000). Your files are indexed, wiki is scaffolded, ready to go.
 
@@ -112,11 +113,11 @@ All writes go to disk first, then update the search index. If Claude creates `/w
 ## Architecture
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   Next.js    │────▶│   FastAPI    │────▶│   SQLite     │
-│   Frontend   │     │   Backend    │     │   (local)    │
-└──────────────┘     └──────┬───────┘     └──────────────┘
-                            │
+┌──────────────┐     ┌──────────────┐     ┌──────────────────────────┐
+│   Next.js    │────▶│   FastAPI    │────▶│   SQLite                 │
+│   Frontend   │     │   Backend    │     │   ├─ FTS5 (keywords)     │
+└──────────────┘     └──────┬───────┘     │   └─ vec0 (embeddings)   │
+                            │             └──────────────────────────┘
                      ┌──────┴───────┐
                      │  MCP Server  │◀──── Claude Desktop / Code
                      │   (stdio)    │
@@ -128,6 +129,19 @@ All writes go to disk first, then update the search index. If Claude creates `/w
 ```
 
 The filesystem is the source of truth. SQLite is a derived index — it accelerates search and stores extracted page data, but it can always be rebuilt from the files. A background file watcher picks up changes you make outside the app.
+
+## Hybrid search
+
+Search combines two signals via **Reciprocal Rank Fusion** (RRF, k=60):
+
+| Signal | How it works | Good at |
+|--------|-------------|---------|
+| **FTS5 BM25** | Porter-stemmed keyword matching | Exact terms, names, acronyms |
+| **sqlite-vec cosine** | 384-dim embeddings from `all-MiniLM-L6-v2` | Synonyms, paraphrases, conceptual queries |
+
+Both run on every search query. Results are ranked by fused score so that a chunk appearing in both result sets ranks highest. If either signal is unavailable (e.g., no embeddings yet, or a malformed FTS query), search falls back gracefully to whichever signal works.
+
+Embeddings are generated locally at ingest time — no API keys or external services needed.
 
 ## Document processing
 
@@ -149,7 +163,7 @@ Set `MISTRAL_API_KEY` for higher-quality PDF OCR with better table and layout de
 - **One workspace = one MCP server.** If you work across multiple research projects, each gets its own folder and its own MCP entry. This is intentional — it keeps context and file access scoped.
 - **PDF table extraction is rough.** pdf-oxide extracts prose reliably but tables come through as messy text. For financial filings or data-heavy PDFs, Mistral OCR is significantly better.
 - **LibreOffice adds setup friction.** Office file conversion requires a local LibreOffice install. If you mostly work with PDFs and markdown, you can skip it entirely.
-- **No vector search in local mode.** Full-text search uses SQLite FTS5 (porter stemming). It works well for keyword queries but does not do semantic/embedding search. The hosted version at llmwiki.app uses PGroonga for ranked search.
+- **Embedding model adds ~80MB to disk.** The `all-MiniLM-L6-v2` model is downloaded on first use. Embedding generation runs on CPU and adds a few seconds to document ingestion.
 
 ## Self-hosting the multi-tenant version
 
