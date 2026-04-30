@@ -57,6 +57,7 @@ async def create_pool(db_path: str) -> aiosqlite.Connection:
     await db.load_extension(sqlite_vec.loadable_path())
     await db.enable_load_extension(False)
     await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
     await db.execute("PRAGMA foreign_keys=ON")
     schema = _SCHEMA_PATH.read_text()
     await db.executescript(schema)

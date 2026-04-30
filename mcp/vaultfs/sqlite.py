@@ -128,6 +128,7 @@ class SqliteVaultFS(VaultFS):
         await _db.load_extension(sqlite_vec.loadable_path())
         await _db.enable_load_extension(False)
         await _db.execute("PRAGMA journal_mode=WAL")
+        await _db.execute("PRAGMA busy_timeout=5000")
         await _db.execute("PRAGMA foreign_keys=ON")
         if _SCHEMA_PATH.exists():
             await _db.executescript(_SCHEMA_PATH.read_text())
