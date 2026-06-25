@@ -280,6 +280,50 @@ def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
     print(json.dumps(config, indent=2))
 
 
+def _reparse_references(ws: Path) -> None:
+    """Rebuild the citation/link graph after a reindex.
+
+    Reindex reassigns document ids, so any reference edges stored earlier point
+    at dead ids. Re-run the canonical reference parser (mcp/tools/references.py)
+    over every wiki page to rebuild document_references against the new ids.
+    Best-effort: needs the project venv (aiosqlite, sqlite-vec). If those can't
+    be imported, the reindex still succeeds — just without the graph.
+    """
+    import asyncio
+    import uuid
+
+    sys.path.insert(0, str(MCP_DIR))
+    try:
+        from vaultfs import SqliteVaultFS
+        from tools.references import update_references
+    except Exception as exc:  # deps missing — degrade gracefully
+        print(f"  (reference graph not rebuilt — run from the project venv: {exc})",
+              file=sys.stderr)
+        return
+
+    async def _run() -> None:
+        await SqliteVaultFS.init(str(ws))
+        try:
+            fs = SqliteVaultFS(str(uuid.uuid5(uuid.NAMESPACE_DNS, "local")))
+            kb = await fs.resolve_kb("")
+            if not kb:
+                return
+            db = SqliteVaultFS._db_or_raise()
+            await db.execute("DELETE FROM document_references")  # clear any stale edges
+            await db.commit()
+            docs = await fs.list_documents_with_content(kb["id"])
+            parsed = 0
+            for doc in docs:
+                if str(doc.get("path", "")).startswith("/wiki") and (doc.get("content") or "").strip():
+                    await update_references(fs, kb["id"], str(doc["id"]), doc["content"], doc["path"])
+                    parsed += 1
+            print(f"  ✓ Reference graph rebuilt ({parsed} wiki pages)")
+        finally:
+            await SqliteVaultFS.close()
+
+    asyncio.run(_run())
+
+
 def cmd_reindex(workspace: str) -> None:
     ws = Path(workspace).resolve()
     db_path = ws / ".llmwiki" / "index.db"
@@ -287,9 +331,12 @@ def cmd_reindex(workspace: str) -> None:
         print(f"No index found. Run: llmwiki init {ws}", file=sys.stderr)
         sys.exit(1)
 
-    # Drop and recreate document-related tables
+    # Drop and recreate document-related tables. foreign_keys=ON so the
+    # DELETE cascades into document_references (et al.) instead of leaving
+    # orphaned edges that point at the about-to-be-reassigned document ids.
     import sqlite3
     conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("DELETE FROM document_chunks")
     conn.execute("DELETE FROM document_pages")
     conn.execute("DELETE FROM documents")
@@ -305,6 +352,7 @@ def cmd_reindex(workspace: str) -> None:
     conn.close()
 
     _index_existing_files(ws, db_path, user_id, ws_id)
+    _reparse_references(ws)
     print(f"✓ Reindexed workspace: {ws}")
 
 

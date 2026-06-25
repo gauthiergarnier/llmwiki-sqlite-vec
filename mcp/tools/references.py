@@ -7,21 +7,33 @@ from vaultfs import VaultFS
 
 logger = logging.getLogger(__name__)
 
-_CITATION_RE = re.compile(r"\[\^\d+\]:\s*(.+)$", re.MULTILINE)
+# Footnote labels may be numeric ([^1]) or alphanumeric ([^a1], [^DIHK]).
+_CITATION_RE = re.compile(r"\[\^[^\]]+\]:\s*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
+
+_KNOWN_EXT = r"(?:pdf|docx?|pptx?|xlsx?|csv|html?|md|txt|png|jpe?g|gif|webp|svg|canvas)"
 
 
 def _parse_citation_filename(raw: str) -> tuple[str, int | None]:
-    """Extract filename and optional page from a citation like 'paper.pdf, p.3'."""
+    """Extract filename and optional page from a citation like 'paper.pdf, p.3'.
+
+    The filename is anchored on a known file extension so names that contain
+    hyphens (e.g. '2026-06-23 - Meeting Notes.md') are not truncated. Any
+    trailing annotation (", p.3", " — note", " (source)", ", §2.3") is dropped.
+    """
     raw = raw.strip().lstrip("*").rstrip("*")
     link_match = re.match(r"\[([^\]]+)\]\([^)]*\)", raw)
     if link_match:
         raw = link_match.group(1)
-    parts = re.match(r"^(.+?)(?:,\s*p\.?\s*(\d+))?(?:\s*[-–—].*)?$", raw)
-    if not parts:
-        return raw, None
-    filename = parts.group(1).strip()
-    page = int(parts.group(2)) if parts.group(2) else None
+    page = None
+    page_match = re.search(r",\s*p\.?\s*(\d+)", raw)
+    if page_match:
+        page = int(page_match.group(1))
+    ext_match = re.search(rf"^(.+\.{_KNOWN_EXT})\b", raw, re.IGNORECASE)
+    if ext_match:
+        filename = ext_match.group(1).strip()
+    else:
+        filename = re.split(r",|\s[-–—]\s", raw, 1)[0].strip()
     return filename, page
 
 
