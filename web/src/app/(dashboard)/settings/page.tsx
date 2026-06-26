@@ -24,12 +24,45 @@ function formatBytes(bytes: number): string {
   return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[i]}`
 }
 
+interface IndexStats {
+  documents: { total: number; wiki_pages: number; sources: number }
+  search: {
+    chunks: number
+    embeddings: number
+    fts_rows: number
+    embedding_model: string
+    embedding_dim: number
+    enabled: boolean
+  }
+  graph: {
+    references: number
+    cites: number
+    links: number
+    sources_connected: number
+    sources_orphan: number
+  }
+}
+
+function Stat({ label, value, hint }: { label: string; value: React.ReactNode; hint?: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-muted/40 p-3">
+      <div className="text-lg font-semibold tabular-nums text-foreground">
+        {typeof value === 'number' ? value.toLocaleString() : value}
+      </div>
+      <div className="mt-0.5 text-xs text-muted-foreground">{label}</div>
+      {hint && <div className="mt-0.5 text-[11px] text-muted-foreground/70">{hint}</div>}
+    </div>
+  )
+}
+
 export default function SettingsPage() {
   const router = useRouter()
   const token = useUserStore((s) => s.accessToken)
   const [usage, setUsage] = React.useState<Usage | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [configCopied, setConfigCopied] = React.useState(false)
+  const [stats, setStats] = React.useState<IndexStats | null>(null)
+  const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
   const oauthConfigJson = buildOAuthMcpConfig()
 
@@ -40,6 +73,13 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [token])
+
+  React.useEffect(() => {
+    if (!token || !isLocal) return
+    apiFetch<IndexStats>('/v1/index-stats', token)
+      .then(setStats)
+      .catch(() => {})
+  }, [token, isLocal])
 
   const handleCopyConfig = async () => {
     try {
@@ -62,6 +102,50 @@ export default function SettingsPage() {
         </button>
         <h1 className="text-xl font-semibold tracking-tight">Settings</h1>
       </div>
+
+      {/* Index (local mode) */}
+      {stats && (
+        <section>
+          <h2 className="text-base font-medium">Index</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Local SQLite index, hybrid search, and the reference graph for this workspace.
+          </p>
+
+          <div className="mt-4 grid grid-cols-3 gap-3">
+            <Stat label="Documents" value={stats.documents.total} />
+            <Stat label="Wiki pages" value={stats.documents.wiki_pages} />
+            <Stat label="Sources" value={stats.documents.sources} />
+          </div>
+
+          <h3 className="mt-6 mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Search · hybrid FTS5 + vector
+          </h3>
+          <div className="grid grid-cols-3 gap-3">
+            <Stat label="Chunks" value={stats.search.chunks} />
+            <Stat label="Embeddings" value={stats.search.embeddings} />
+            <Stat
+              label="Status"
+              value={stats.search.enabled ? 'Active' : 'Empty'}
+              hint={`${stats.search.embedding_model} · ${stats.search.embedding_dim}d`}
+            />
+          </div>
+
+          <h3 className="mt-6 mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            Reference graph
+          </h3>
+          <div className="grid grid-cols-3 gap-3">
+            <Stat label="Citations" value={stats.graph.cites} />
+            <Stat label="Wiki links" value={stats.graph.links} />
+            <Stat
+              label="Sources cited"
+              value={`${stats.graph.sources_connected} / ${stats.documents.sources}`}
+              hint={stats.graph.sources_orphan > 0 ? `${stats.graph.sources_orphan.toLocaleString()} orphan` : 'all linked'}
+            />
+          </div>
+        </section>
+      )}
+
+      {stats && <div className="h-px bg-border my-8" />}
 
       {/* Usage */}
       {usage && (

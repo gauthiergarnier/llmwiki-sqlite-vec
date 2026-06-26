@@ -201,9 +201,11 @@ if settings.MODE == "local":
     from routes.local_upload import router as local_upload_router
     from routes.files import router as files_router, set_workspace_root
     from routes.local_graph import router as local_graph_router
+    from routes.local_stats import router as local_stats_router
     app.include_router(local_upload_router)
     app.include_router(files_router)
     app.include_router(local_graph_router)
+    app.include_router(local_stats_router)
     set_workspace_root(settings.WORKSPACE_PATH)
 else:
     from routes.api_keys import router as api_keys_router
