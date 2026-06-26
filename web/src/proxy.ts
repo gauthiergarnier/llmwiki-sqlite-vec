@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === "local";
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   if (isLocal) {
     // Local mode: no auth, all routes accessible
     // Redirect root to /wikis

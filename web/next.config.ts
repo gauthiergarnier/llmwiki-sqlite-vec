@@ -9,5 +9,13 @@ const nextConfig: NextConfig = {
 
 export default withSentryConfig(nextConfig, {
   silent: true,
-  disableLogger: true,
+  // `disableLogger` was renamed to `webpack.treeshake.removeDebugLogging`.
+  // It's webpack-only (a no-op under Turbopack, which we use for dev) but it
+  // silences the deprecation warning and still strips Sentry debug logging
+  // from webpack production builds.
+  webpack: {
+    treeshake: {
+      removeDebugLogging: true,
+    },
+  },
 });
