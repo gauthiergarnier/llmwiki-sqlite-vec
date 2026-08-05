@@ -127,6 +127,32 @@ LLM Wiki adds two things to your folder. Source files are not moved or modified.
 - `wiki/` — ordinary markdown files. Edit them in any editor. Claude writes and updates them via MCP.
 - `.llmwiki/` — SQLite search index and processed artifacts. Delete it anytime; `llmwiki reindex` rebuilds from the source files.
 
+## Memory (bi-temporal, optional parallel server)
+
+The wiki holds the *current synthesized state*. A second, **standalone** MCP server adds a continuously-learning memory layer so the knowledge base evolves over time instead of just being overwritten — it **supersedes** facts and decisions while *retaining* the old ones and the reasoning behind them.
+
+- **Quick memory** (`recall`) — the current, valid facts/decisions (the fast answer).
+- **History** (`history`) — supersession chains (A→B→C) with each step's rationale and validity window: *why we ended where we did*. Supports `as_of` time-travel.
+- **Remember** (`remember`) — record a fact or decision; **supersede, don't delete**. An uncertainty-gated inconsistency check runs on every write: confident conflicts reconcile automatically, ambiguous ones become a **clarification** (AskUserQuestion-shaped) for you to resolve via the `clarifications` tool.
+
+It is fully **isolated and non-breaking**: it owns its own database (`.llmwiki/memory.db`) and append-only `wiki/.memory/*.jsonl`, and never touches `index.db` or the wiki server.
+
+```bash
+# Run it alongside the wiki server, against the same workspace:
+./run-memory-mcp.sh ~/research
+```
+
+Register both servers with Claude (`.mcp.json` / Claude Code `settings.json`):
+
+```json
+{ "mcpServers": {
+  "llmwiki":        { "command": "/abs/path/llmwiki-sqlite-vec/run-mcp.sh",        "args": ["/path/to/research"] },
+  "llmwiki-memory": { "command": "/abs/path/llmwiki-sqlite-vec/run-memory-mcp.sh", "args": ["/path/to/research"] }
+} }
+```
+
+An optional background "sleep-time" consolidator (local LLM via Ollama) distills episodes and sweeps for contradictions when you're idle, applying confident merges and escalating uncertain ones as clarifications. See [`memory/README.md`](memory/README.md) for setup, configuration, and scheduling.
+
 By default, indexing, storage, and file writes happen on your machine. No cloud services required.
 
 ## How Claude interacts with the workspace

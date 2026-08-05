@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd template for scheduled memory consolidation.
+     Copy to ~/Library/LaunchAgents/com.llmwiki.memory-consolidate.plist,
+     replace __REPO__ and __WORKSPACE__ with absolute paths, then:
+       launchctl load ~/Library/LaunchAgents/com.llmwiki.memory-consolidate.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.llmwiki.memory-consolidate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/.venv/bin/python3</string>
+        <string>-m</string>
+        <string>memory.consolidate</string>
+        <string>__WORKSPACE__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CONSOLIDATION_ENABLED</key>
+        <string>true</string>
+        <key>CONSOLIDATION_MODE</key>
+        <string>auto</string>
+    </dict>
+
+    <!-- Run nightly at 03:00. Adjust as you like. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__WORKSPACE__/.llmwiki/consolidate.log</string>
+    <key>StandardErrorPath</key>
+    <string>__WORKSPACE__/.llmwiki/consolidate.log</string>
+</dict>
+</plist>
