@@ -1,0 +1,6 @@
+flow: simple
+version: 0.1.65
+installed_at: '2026-05-13T23:29:44.615Z'
+tools:
+  - claude
+  - copilot
