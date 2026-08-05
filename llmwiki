@@ -24,6 +24,32 @@ REPO_ROOT = Path(__file__).resolve().parent
 API_DIR = REPO_ROOT / "api"
 MCP_DIR = REPO_ROOT / "mcp"
 WEB_DIR = REPO_ROOT / "web"
+VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+
+# Guard env var: set on the re-exec'd process so it can't loop.
+_REEXEC_FLAG = "LLMWIKI_VENV_REEXEC"
+
+
+def _reexec_in_venv() -> None:
+    """Hand off to the project venv when invoked with another interpreter.
+
+    Subcommands spawn uvicorn and the MCP server with ``sys.executable``, so
+    running ``./llmwiki`` without the venv active (the shebang picks whatever
+    ``python3`` is on PATH) starts an interpreter with no dependencies
+    installed. Same for the ``mcp-config`` snippet, which points Claude at
+    this script directly.
+    """
+    if os.environ.get(_REEXEC_FLAG) or not VENV_PYTHON.exists():
+        return
+    if Path(sys.executable).resolve() == VENV_PYTHON.resolve():
+        return
+
+    os.environ[_REEXEC_FLAG] = "1"
+    script = str(Path(__file__).resolve())
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), script, *sys.argv[1:]])
+
+
+_reexec_in_venv()
 
 
 def _sanitize_name(name: str) -> str:
@@ -253,6 +279,8 @@ def cmd_mcp(workspace: str) -> None:
     if not (ws / ".llmwiki" / "index.db").exists():
         cmd_init(str(ws))
 
+    # local_server uses top-level absolute imports, so it only resolves from mcp/
+    os.chdir(MCP_DIR)
     os.execvp(
         sys.executable,
         [sys.executable, "-m", "local_server", "--workspace", str(ws)],
