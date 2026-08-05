@@ -16,6 +16,7 @@ tsconfig.tsbuildinfo
 .env
 .env.*
 !.env.example
+importers/gmeet/credentials/client_secret.json
 
 # Python
 __pycache__/
