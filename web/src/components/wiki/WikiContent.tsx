@@ -22,19 +22,27 @@ export interface TocItem {
   level: 2 | 3
 }
 
+function cleanHeadingText(raw: string): string {
+  return raw.replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
+}
+
 export function extractTocFromMarkdown(md: string): TocItem[] {
   const items: TocItem[] = []
-  const lines = md.split('\n')
-  for (const line of lines) {
-    const m2 = line.match(/^##\s+(.+)/)
-    const m3 = line.match(/^###\s+(.+)/)
-    if (m2) {
-      const text = m2[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 2 })
-    } else if (m3) {
-      const text = m3[1].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
-      items.push({ id: slugify(text), text, level: 3 })
+  // Same dedupe sequence as the h1–h4 renderers, so TOC ids match DOM ids.
+  const slug = createSlugger()
+  let inFence = false
+  for (const line of md.split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence
+      continue
     }
+    if (inFence) continue
+    const m = line.match(/^(#{1,4})\s+(.+)/)
+    if (!m) continue
+    const level = m[1].length
+    const text = cleanHeadingText(m[2])
+    const id = slug(text)
+    if (level === 2 || level === 3) items.push({ id, text, level })
   }
   return items
 }
@@ -46,6 +54,17 @@ function slugify(text: string): string {
     .replace(/\s+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '')
+}
+
+/** GitHub-style unique slugs: "foo", "foo-1", "foo-2", ... */
+function createSlugger(): (text: string) => string {
+  const seen = new Map<string, number>()
+  return (text: string) => {
+    const base = slugify(text)
+    const n = seen.get(base) ?? 0
+    seen.set(base, n + 1)
+    return n === 0 ? base : `${base}-${n}`
+  }
 }
 
 function stripLeadingH1(content: string, title: string): string {
@@ -353,6 +372,9 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
   const [copied, setCopied] = React.useState(false)
+  // Fresh slugger per render so duplicate headings get the same -1/-2 suffixes as the TOC.
+  const slugRef = React.useRef(createSlugger())
+  slugRef.current = createSlugger()
 
   const handleCopy = React.useCallback(() => {
     navigator.clipboard.writeText(content).then(() => {
@@ -376,7 +398,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
     () => ({
       h1({ children }) {
         const text = childrenToText(children)
-        const id = slugify(text)
+        const id = slugRef.current(text)
         return (
           <h1 id={id} className="text-2xl font-bold tracking-tight mt-8 mb-3 first:mt-0 scroll-mt-20">
             {children}
@@ -385,7 +407,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
       },
       h2({ children }) {
         const text = childrenToText(children)
-        const id = slugify(text)
+        const id = slugRef.current(text)
         return (
           <h2 id={id} className="text-xl font-semibold tracking-tight mt-6 mb-2 pt-2 border-t border-border/50 first:border-0 first:pt-0 scroll-mt-20">
             {children}
@@ -394,7 +416,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
       },
       h3({ children }) {
         const text = childrenToText(children)
-        const id = slugify(text)
+        const id = slugRef.current(text)
         return (
           <h3 id={id} className="text-lg font-medium tracking-tight mt-6 mb-1.5 scroll-mt-20">
             {children}
@@ -403,7 +425,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
       },
       h4({ children }) {
         const text = childrenToText(children)
-        const id = slugify(text)
+        const id = slugRef.current(text)
         return (
           <h4 id={id} className="text-base font-medium mt-5 mb-1 scroll-mt-20">
             {children}
@@ -725,7 +747,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
             )}
             <div className="wiki-content text-[15px] leading-relaxed">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkMath]}
+                remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
                 rehypePlugins={[rehypeKatex]}
                 components={components}
               >
