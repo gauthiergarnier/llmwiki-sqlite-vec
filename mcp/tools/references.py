@@ -1,7 +1,7 @@
 """Parse citations and cross-references from wiki page content, store as edges."""
 
-import re
 import logging
+import re
 
 from vaultfs import VaultFS
 
@@ -11,7 +11,9 @@ logger = logging.getLogger(__name__)
 # Use [ \t]* rather than \s*: \s matches newlines, so an *inline* footnote
 # reference ending a line before a colon -- "**Mechanics agreed**[^smurfit]:" --
 # would consume the newline and read the FOLLOWING line as the citation target.
-_CITATION_RE = re.compile(r"\[\^[^\]]+\]:[ \t]*(.+)$", re.MULTILINE)
+# Anchored at line start (≤3 spaces, as in CommonMark): a mid-line "claim[^x]: more text"
+# is an inline reference followed by a colon, not a definition.
+_CITATION_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:[ \t]*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
 
 _KNOWN_EXT = r"(?:pdf|docx?|pptx?|xlsx?|csv|html?|md|txt|png|jpe?g|gif|webp|svg|canvas)"
@@ -25,9 +27,10 @@ def _parse_citation_filename(raw: str) -> tuple[str, int | None]:
     trailing annotation (", p.3", " — note", " (source)", ", §2.3") is dropped.
     """
     raw = raw.strip().lstrip("*").rstrip("*")
-    link_match = re.match(r"\[([^\]]+)\]\([^)]*\)", raw)
+    link_match = re.match(r"\[([^\]]+)\]\([^)]*\)(.*)$", raw)
     if link_match:
-        raw = link_match.group(1)
+        # Keep any trailing annotation after the link so ", p.3" still parses.
+        raw = f"{link_match.group(1)}{link_match.group(2)}"
     page = None
     page_match = re.search(r",\s*p\.?\s*(\d+)", raw)
     if page_match:
@@ -36,7 +39,7 @@ def _parse_citation_filename(raw: str) -> tuple[str, int | None]:
     if ext_match:
         filename = ext_match.group(1).strip()
     else:
-        filename = re.split(r",|\s[-–—]\s", raw, 1)[0].strip()
+        filename = re.split(r",|\s[-–—]\s", raw, maxsplit=1)[0].strip()
     return filename, page
 
 
@@ -81,6 +84,7 @@ async def update_references(fs: VaultFS, kb_id: str, document_id: str, content: 
     all_docs = await fs.list_documents(kb_id)
 
     filename_to_doc: dict[str, dict] = {}
+    basename_to_doc: dict[str, dict] = {}
     wiki_path_to_doc: dict[str, dict] = {}
     for doc in all_docs:
         fn_lower = doc["filename"].lower()
@@ -90,6 +94,13 @@ async def update_references(fs: VaultFS, kb_id: str, document_id: str, content: 
             title_lower = doc["title"].lower()
             if title_lower not in filename_to_doc:
                 filename_to_doc[title_lower] = doc
+
+        base = re.sub(
+            r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$",
+            "",
+            fn_lower,
+        )
+        basename_to_doc.setdefault(base, doc)
 
         if doc["path"].startswith("/wiki/"):
             relative = (doc["path"] + doc["filename"]).replace("/wiki/", "", 1)
@@ -103,11 +114,7 @@ async def update_references(fs: VaultFS, kb_id: str, document_id: str, content: 
         target = filename_to_doc.get(fn_lower)
         if not target:
             base = re.sub(r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$", "", fn_lower)
-            for doc in all_docs:
-                doc_base = re.sub(r"\.(pdf|docx?|pptx?|xlsx?|csv|html?|md|txt)$", "", doc["filename"].lower())
-                if doc_base == base:
-                    target = doc
-                    break
+            target = basename_to_doc.get(base)
         if target and str(target["id"]) != document_id:
             edges.append((str(target["id"]), "cites", page))
 
@@ -122,15 +129,16 @@ async def update_references(fs: VaultFS, kb_id: str, document_id: str, content: 
         if target and str(target["id"]) != document_id:
             edges.append((str(target["id"]), "links_to", None))
 
-    await fs.delete_references(document_id)
-
-    seen = set()
+    deduped: list[tuple[str, str, int | None]] = []
+    seen: set[tuple[str, str]] = set()
     for target_id, ref_type, page in edges:
         key = (target_id, ref_type)
         if key in seen:
             continue
         seen.add(key)
-        await fs.upsert_reference(document_id, target_id, kb_id, ref_type, page)
+        deduped.append((target_id, ref_type, page))
+
+    await fs.replace_references(document_id, kb_id, deduped)
 
     logger.info(
         "Updated references for doc=%s: %d citations, %d links",

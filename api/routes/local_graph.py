@@ -1,8 +1,7 @@
 """Local graph routes — thin HTTP layer, delegates to services/graph.py."""
 
-from fastapi import APIRouter, Depends, Request
-
 from deps import get_user_id
+from fastapi import APIRouter, Depends, Request
 from services.graph import get_graph_local, rebuild_local
 
 router = APIRouter(tags=["graph"])

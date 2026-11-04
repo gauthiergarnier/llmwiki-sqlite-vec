@@ -1,12 +1,11 @@
-"""Graph service — queries and rebuilds the document reference graph.
-
-All SQL lives here. Routes should never execute queries directly.
-"""
+"""Query and rebuild the document reference graph; routes never run graph SQL directly."""
 
 import json
 import logging
 import uuid
 
+import asyncpg
+from infra.db.sqlite import rows_to_dicts, serialized_write
 from services.references import build_lookup_maps, extract_references
 
 logger = logging.getLogger(__name__)
@@ -16,7 +15,7 @@ def _parse_json(raw, default=None):
     """Safely parse a JSON string or return the value if already parsed."""
     if raw is None:
         return default
-    if isinstance(raw, (dict, list)):
+    if isinstance(raw, dict | list):
         return raw
     try:
         return json.loads(raw)
@@ -47,8 +46,6 @@ def _build_edge(r: dict) -> dict:
     }
 
 
-# ── Hosted (asyncpg) ──
-
 async def get_graph_hosted(conn, kb_id, user_id: str) -> dict:
     """Return {nodes, edges} for the knowledge graph viewer."""
     doc_rows = await conn.fetch(
@@ -76,12 +73,7 @@ async def get_graph_hosted(conn, kb_id, user_id: str) -> dict:
 
 
 async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
-    """Parse wiki pages and rebuild reference edges atomically.
-
-    Runs through RLS (authenticated role) — the database enforces that
-    the user can only read/write their own documents and references.
-    Uses a savepoint for atomicity within the ScopedDB transaction.
-    """
+    """Rebuild reference edges atomically under RLS, as a savepoint in the ScopedDB transaction."""
     all_docs = [dict(r) for r in await conn.fetch(
         "SELECT id, filename, title, path, file_type "
         "FROM documents "
@@ -95,12 +87,11 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
         "SELECT id, filename, path, content "
         "FROM documents "
         "WHERE knowledge_base_id = $1 AND user_id = $2 "
-        "AND path LIKE '/wiki/%%' AND NOT archived AND file_type = 'md' "
+        "AND path LIKE '/wiki/%' AND NOT archived AND file_type = 'md' "
         "AND content IS NOT NULL AND content != ''",
         kb_id, user_id,
     )]
 
-    # Atomic: transaction wraps the delete + all inserts
     async with conn.transaction():
         await conn.execute(
             "DELETE FROM document_references "
@@ -109,8 +100,8 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
             kb_id, user_id,
         )
 
-        total_cites = 0
-        total_links = 0
+        cites: list[tuple] = []
+        links: list[tuple] = []
 
         for page in wiki_pages:
             content = page["content"] or ""
@@ -125,59 +116,61 @@ async def rebuild_hosted(conn, kb_id, user_id: str) -> dict:
 
             for edge in edges:
                 if edge["type"] == "cites":
-                    await conn.execute(
-                        "INSERT INTO document_references "
-                        "(source_document_id, target_document_id, knowledge_base_id, reference_type, page) "
-                        "VALUES ($1, $2, $3, 'cites', $4) "
-                        "ON CONFLICT (source_document_id, target_document_id, reference_type) "
-                        "DO UPDATE SET page = EXCLUDED.page, created_at = now()",
-                        page["id"], edge["target_id"], kb_id, edge["page"],
-                    )
-                    total_cites += 1
+                    cites.append((page["id"], edge["target_id"], edge["page"]))
                 else:
-                    await conn.execute(
-                        "INSERT INTO document_references "
-                        "(source_document_id, target_document_id, knowledge_base_id, reference_type) "
-                        "VALUES ($1, $2, $3, 'links_to') "
-                        "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
-                        page["id"], edge["target_id"], kb_id,
-                    )
-                    total_links += 1
+                    links.append((page["id"], edge["target_id"]))
 
-    logger.info("Rebuilt references for KB %s: %d citations, %d links", str(kb_id)[:8], total_cites, total_links)
-    return {"citations": total_cites, "links": total_links}
+        await _insert_cites(conn, kb_id, cites)
+        await _insert_links(conn, kb_id, links)
+
+    logger.info("Rebuilt references for KB %s: %d citations, %d links", str(kb_id)[:8], len(cites), len(links))
+    return {"citations": len(cites), "links": len(links)}
 
 
-# ── Local (aiosqlite) ──
+async def _insert_cites(conn: asyncpg.Connection, kb_id: str, cites: list[tuple]) -> None:
+    await conn.execute(
+        "INSERT INTO document_references "
+        "(source_document_id, target_document_id, knowledge_base_id, reference_type, page) "
+        "SELECT e.source_id, e.target_id, $1::uuid, 'cites', e.page "
+        "FROM UNNEST($2::uuid[], $3::uuid[], $4::int[]) AS e(source_id, target_id, page) "
+        "ON CONFLICT (source_document_id, target_document_id, reference_type) "
+        "DO UPDATE SET page = EXCLUDED.page, created_at = now()",
+        kb_id,
+        [source_id for source_id, _, _ in cites],
+        [target_id for _, target_id, _ in cites],
+        [page for _, _, page in cites],
+    )
 
-async def _fetch_dicts(db, sql: str, params=()) -> list[dict]:
-    """Fetch rows as column-keyed dicts.
 
-    The local connection uses row_factory=None, so cursors yield plain tuples;
-    the node/edge builders (and lookup maps) expect dict-like rows.
-    """
-    cursor = await db.execute(sql, params)
-    cols = [c[0] for c in cursor.description]
-    rows = await cursor.fetchall()
-    return [dict(zip(cols, row)) for row in rows]
+async def _insert_links(conn: asyncpg.Connection, kb_id: str, links: list[tuple]) -> None:
+    await conn.execute(
+        "INSERT INTO document_references "
+        "(source_document_id, target_document_id, knowledge_base_id, reference_type) "
+        "SELECT e.source_id, e.target_id, $1::uuid, 'links_to' "
+        "FROM UNNEST($2::uuid[], $3::uuid[]) AS e(source_id, target_id) "
+        "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
+        kb_id,
+        [source_id for source_id, _ in links],
+        [target_id for _, target_id in links],
+    )
 
 
 async def get_graph_local(db, user_id: str) -> dict:
     """Return {nodes, edges} for the knowledge graph viewer (SQLite)."""
-    doc_rows = await _fetch_dicts(
-        db,
+    doc_cursor = await db.execute(
         "SELECT id, filename, title, path, file_type, source_kind, metadata, tags "
         "FROM documents WHERE user_id = ? AND status != 'failed'",
         (user_id,),
     )
+    doc_rows = rows_to_dicts(doc_cursor, await doc_cursor.fetchall())
 
     doc_ids = {r["id"] for r in doc_rows}
 
-    ref_rows = await _fetch_dicts(
-        db,
+    ref_cursor = await db.execute(
         "SELECT source_document_id, target_document_id, reference_type, page "
         "FROM document_references",
     )
+    ref_rows = rows_to_dicts(ref_cursor, await ref_cursor.fetchall())
 
     return {
         "nodes": [_build_node(r) for r in doc_rows],
@@ -188,58 +181,64 @@ async def get_graph_local(db, user_id: str) -> dict:
 
 async def rebuild_local(db, user_id: str) -> dict:
     """Parse wiki pages and rebuild reference edges atomically (SQLite)."""
-    all_docs = await _fetch_dicts(
-        db,
+    docs_cursor = await db.execute(
         "SELECT id, filename, title, path, file_type, source_kind "
         "FROM documents WHERE user_id = ?",
         (user_id,),
     )
+    all_docs = rows_to_dicts(docs_cursor, await docs_cursor.fetchall())
 
     filename_to_doc, base_to_doc, wiki_path_to_doc = build_lookup_maps(all_docs)
 
-    wiki_pages = await _fetch_dicts(
-        db,
+    wiki_cursor = await db.execute(
         "SELECT id, filename, path, content FROM documents "
         "WHERE user_id = ? AND source_kind = 'wiki' AND file_type = 'md' AND content IS NOT NULL",
         (user_id,),
     )
+    wiki_pages = rows_to_dicts(wiki_cursor, await wiki_cursor.fetchall())
 
-    # Atomic: delete + inserts in a single transaction (commit only at the end)
-    await db.execute("DELETE FROM document_references")
+    # Roll back on any failure so a mid-rebuild error can't leave the graph wiped.
+    async with serialized_write():
+        try:
+            await db.execute("DELETE FROM document_references")
 
-    total_cites = 0
-    total_links = 0
+            total_cites = 0
+            total_links = 0
 
-    for page in wiki_pages:
-        content = page["content"] or ""
-        if not content:
-            continue
+            for page in wiki_pages:
+                content = page["content"] or ""
+                if not content:
+                    continue
 
-        wiki_dir = page["path"].replace("/wiki/", "", 1) if page["path"].startswith("/wiki/") else ""
-        edges = extract_references(
-            content, page["id"], wiki_dir,
-            filename_to_doc, base_to_doc, wiki_path_to_doc,
-        )
-
-        for edge in edges:
-            if edge["type"] == "cites":
-                await db.execute(
-                    "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type, page) "
-                    "VALUES (?, ?, ?, 'cites', ?) "
-                    "ON CONFLICT (source_document_id, target_document_id, reference_type) "
-                    "DO UPDATE SET page = excluded.page",
-                    (str(uuid.uuid4()), page["id"], edge["target_id"], edge["page"]),
+                wiki_dir = page["path"].replace("/wiki/", "", 1) if page["path"].startswith("/wiki/") else ""
+                edges = extract_references(
+                    content, page["id"], wiki_dir,
+                    filename_to_doc, base_to_doc, wiki_path_to_doc,
                 )
-                total_cites += 1
-            else:
-                await db.execute(
-                    "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type) "
-                    "VALUES (?, ?, ?, 'links_to') "
-                    "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
-                    (str(uuid.uuid4()), page["id"], edge["target_id"]),
-                )
-                total_links += 1
 
-    await db.commit()
+                for edge in edges:
+                    if edge["type"] == "cites":
+                        await db.execute(
+                            "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type, page) "
+                            "VALUES (?, ?, ?, 'cites', ?) "
+                            "ON CONFLICT (source_document_id, target_document_id, reference_type) "
+                            "DO UPDATE SET page = excluded.page",
+                            (str(uuid.uuid4()), page["id"], edge["target_id"], edge["page"]),
+                        )
+                        total_cites += 1
+                    else:
+                        await db.execute(
+                            "INSERT INTO document_references (id, source_document_id, target_document_id, reference_type) "
+                            "VALUES (?, ?, ?, 'links_to') "
+                            "ON CONFLICT (source_document_id, target_document_id, reference_type) DO NOTHING",
+                            (str(uuid.uuid4()), page["id"], edge["target_id"]),
+                        )
+                        total_links += 1
+
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
     logger.info("Rebuilt references: %d citations, %d links", total_cites, total_links)
     return {"citations": total_cites, "links": total_links}

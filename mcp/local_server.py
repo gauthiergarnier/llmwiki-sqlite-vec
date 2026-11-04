@@ -1,11 +1,4 @@
-"""Local MCP server for stdio (Claude Desktop / Claude Code / Cursor).
-
-One workspace = one MCP server. Filesystem is truth. SQLite is the index.
-
-Usage:
-    python -m local_server --workspace ~/research
-    python -m local_server ~/research
-"""
+"""Local stdio MCP server for one workspace: the filesystem is truth, SQLite is the index."""
 
 import argparse
 import asyncio
@@ -13,6 +6,7 @@ import logging
 import os
 import sys
 import uuid
+from datetime import date
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -26,6 +20,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="LLM Wiki local MCP server")
     parser.add_argument("workspace", nargs="?", default=".", help="Path to workspace folder")
     parser.add_argument("--workspace", dest="workspace_flag", default=None, help="Path to workspace folder")
+    parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+    parser.add_argument("--port", type=int, default=8100, help="Port for streamable-http transport")
     return parser.parse_args()
 
 
@@ -45,27 +41,29 @@ async def _init_workspace(workspace_path: str) -> None:
     if not existing:
         ws_name = ws.name
         ws_id = await fs.ensure_workspace(ws_name)
+        today = date.today().isoformat()
+        overview_content = (
+            "---\n"
+            "title: Overview\n"
+            f"description: Research hub for {ws_name}.\n"
+            f"date: {today}\n"
+            "tags: [overview, wiki]\n"
+            "---\n\n"
+            f"This wiki tracks research on {ws_name}.\n\n"
+            "## Key Findings\n\n"
+            "No sources ingested yet."
+        )
 
         await fs.create_document(
             ws_id, "overview.md", "Overview", "/wiki/", "md",
-            f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet.\n\n## Recent Updates\n\nNo activity yet.",
-            ["overview"],
+            overview_content,
+            ["overview", "wiki"],
+            date=today,
+            metadata={"description": f"Research hub for {ws_name}."},
         )
-        await fs.create_document(
-            ws_id, "log.md", "Log", "/wiki/", "md",
-            "Chronological record of ingests, queries, and maintenance passes.",
-            ["log"],
-        )
-
         overview_path = ws / "wiki" / "overview.md"
         if not overview_path.exists():
-            overview_path.write_text(
-                f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\n"
-                "No sources ingested yet.\n\n## Recent Updates\n\nNo activity yet.\n"
-            )
-        log_path = ws / "wiki" / "log.md"
-        if not log_path.exists():
-            log_path.write_text("Chronological record of ingests, queries, and maintenance passes.\n")
+            overview_path.write_text(overview_content + "\n", encoding="utf-8")
 
         logger.info("Initialized workspace: %s", ws)
     else:
@@ -82,9 +80,10 @@ def main():
     loop = asyncio.new_event_loop()
     loop.run_until_complete(_init_workspace(workspace))
 
-    from mcp.server.fastmcp import FastMCP
     from tools import register
     from vaultfs import SqliteVaultFS
+
+    from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP(
         name="LLM Wiki",
@@ -105,7 +104,12 @@ def main():
         return "pong"
 
     logger.info("Local MCP server ready — workspace: %s", workspace)
-    asyncio.run(mcp.run_stdio_async())
+    if args.transport == "streamable-http":
+        mcp.settings.host = "127.0.0.1"
+        mcp.settings.port = args.port
+        asyncio.run(mcp.run_streamable_http_async())
+    else:
+        asyncio.run(mcp.run_stdio_async())
 
 
 if __name__ == "__main__":

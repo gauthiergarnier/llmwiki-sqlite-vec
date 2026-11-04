@@ -1,13 +1,128 @@
-"""Tier 1: VaultFS contract tests against SqliteVaultFS.
+"""VaultFS contract tests against SqliteVaultFS."""
 
-Tests every VaultFS method. Self-contained — no Postgres needed.
-"""
+import uuid
 
 import pytest
+
 from tests.integration.mcp.conftest import TEST_USER_ID
 
 
 class TestWorkspace:
+
+    async def test_create_knowledge_base_initializes_empty_workspace(self, workspace):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            instance = SqliteVaultFS(TEST_USER_ID)
+            kb = await instance.create_knowledge_base("Research Notes", "Test workspace")
+
+            assert kb["name"] == "Research Notes"
+            assert kb["slug"] == "Research Notes"
+            assert kb["already_exists"] is False
+            assert kb["local_singleton"] is True
+
+            docs = await instance.list_documents(kb["id"])
+            wiki_files = {doc["path"] + doc["filename"] for doc in docs}
+            assert "/wiki/overview.md" in wiki_files
+            assert "/wiki/log.md" not in wiki_files
+            overview = await instance.get_document(kb["id"], "overview.md", "/wiki/")
+            assert overview["content"].startswith("---\n")
+            assert overview["tags"] == ["overview", "wiki"]
+            assert overview["date"]
+            assert (workspace / "wiki" / "overview.md").exists()
+            assert not (workspace / "wiki" / "log.md").exists()
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_create_knowledge_base_returns_existing_local_workspace(self, fs):
+        instance, kb_id = fs
+        kb = await instance.create_knowledge_base("Another KB", "Should not create a second workspace")
+
+        assert kb["id"] == kb_id
+        assert kb["name"] == "test-workspace"
+        assert kb["slug"] == "test-workspace"
+        assert kb["already_exists"] is True
+        assert kb["local_singleton"] is True
+
+    async def test_scaffold_does_not_overwrite_existing_local_files(self, workspace):
+        """A rebuilt index (no workspace row) must not clobber real local files."""
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            (workspace / "wiki" / "overview.md").write_text("MY REAL NOTES", encoding="utf-8")
+            instance = SqliteVaultFS(TEST_USER_ID)
+            await instance.create_knowledge_base("Rebuilt", None)
+
+            # The existing overview is preserved and no legacy activity log is scaffolded.
+            assert (workspace / "wiki" / "overview.md").read_text(encoding="utf-8") == "MY REAL NOTES"
+            assert not (workspace / "wiki" / "log.md").exists()
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_create_knowledge_base_defaults_to_wiki_kind(self, workspace):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            instance = SqliteVaultFS(TEST_USER_ID)
+            await instance.create_knowledge_base("Plain Wiki", None)
+            cursor = await SqliteVaultFS._db_or_raise().execute("SELECT kind FROM workspace")
+            assert (await cursor.fetchone())[0] == "wiki"
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_create_knowledge_base_persists_course_kind(self, workspace):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            instance = SqliteVaultFS(TEST_USER_ID)
+            await instance.create_knowledge_base("Intro Course", None, kind="course")
+            cursor = await SqliteVaultFS._db_or_raise().execute("SELECT kind FROM workspace")
+            assert (await cursor.fetchone())[0] == "course"
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_create_course_upgrades_existing_local_workspace(self, workspace):
+        from vaultfs.sqlite import SqliteVaultFS
+
+        await SqliteVaultFS.close()
+        await SqliteVaultFS.init(str(workspace))
+        try:
+            instance = SqliteVaultFS(TEST_USER_ID)
+            await instance.create_knowledge_base("My Vault", None)
+            kb = await instance.create_knowledge_base("My Vault", None, kind="course")
+            assert kb["already_exists"] is True
+            assert kb["kind"] == "course"
+            cursor = await SqliteVaultFS._db_or_raise().execute("SELECT kind FROM workspace")
+            assert (await cursor.fetchone())[0] == "course"
+        finally:
+            await SqliteVaultFS.close()
+
+    async def test_update_knowledge_base_converts_kind_both_ways(self, fs):
+        instance, kb_id = fs
+        to_course = await instance.update_knowledge_base(kb_id, kind="course")
+        assert to_course["kind"] == "course"
+        back_to_wiki = await instance.update_knowledge_base(kb_id, kind="wiki")
+        assert back_to_wiki["kind"] == "wiki"
+
+    async def test_update_knowledge_base_renames(self, fs):
+        instance, kb_id = fs
+        updated = await instance.update_knowledge_base(kb_id, name="Renamed Vault")
+        assert updated["name"] == "Renamed Vault"
+        assert updated["slug"] == "Renamed Vault"  # local slug is the name
+
+    async def test_update_knowledge_base_sets_description_only(self, fs):
+        instance, kb_id = fs
+        updated = await instance.update_knowledge_base(kb_id, description="A vault about tests.")
+        assert updated["description"] == "A vault about tests."
+        assert updated["name"] == "test-workspace"
 
     async def test_resolve_kb_returns_workspace(self, fs):
         instance, kb_id = fs
@@ -45,7 +160,7 @@ class TestDocumentCRUD:
 
     async def test_create_wiki_document(self, fs):
         instance, kb_id = fs
-        doc = await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
+        await instance.create_document(kb_id, "scaling.md", "Scaling", "/wiki/concepts/", "md", "# Scaling", ["concept"])
         fetched = await instance.get_document(kb_id, "scaling.md", "/wiki/concepts/")
         assert fetched is not None
         assert fetched["content"] == "# Scaling"
@@ -75,10 +190,15 @@ class TestDocumentCRUD:
     async def test_update_document_content_and_version(self, fs):
         instance, kb_id = fs
         doc = await instance.create_document(kb_id, "notes.md", "Notes", "/", "md", "v1", ["tag"])
-        await instance.update_document(str(doc["id"]), "v2")
+        updated = await instance.update_document(str(doc["id"]), "v2")
+        assert updated == {"id": doc["id"], "filename": "notes.md", "path": "/"}
         fetched = await instance.get_document(kb_id, "notes.md", "/")
         assert fetched["content"] == "v2"
-        assert fetched["version"] == 1
+        assert fetched["version"] == 2
+
+    async def test_update_document_missing_returns_none(self, fs):
+        instance, _ = fs
+        assert await instance.update_document(str(uuid.uuid4()), "body") is None
 
     async def test_update_document_optional_fields(self, fs):
         instance, kb_id = fs
@@ -122,6 +242,33 @@ class TestDocumentCRUD:
         assert len(rich) == 1
         assert rich[0]["content"] == "full content"
 
+    async def test_list_documents_with_content_pushes_path_and_budget(self, fs):
+        instance, kb_id = fs
+        await instance.create_document(kb_id, "root.md", "Root", "/", "md", "root body", ["tag"])
+        await instance.create_document(
+            kb_id, "wiki.md", "Wiki", "/wiki/", "md", "abcdefghij", ["tag"]
+        )
+
+        docs = await instance.list_documents_with_content(
+            kb_id,
+            path_glob="/wiki/**",
+            content_limit=4,
+        )
+
+        assert [doc["filename"] for doc in docs] == ["wiki.md"]
+        assert docs[0]["content"] == "abcd"
+        assert docs[0]["content_truncated"] is True
+
+    async def test_lint_hydration_skips_source_bodies(self, fs):
+        instance, kb_id = fs
+        await instance.create_document(kb_id, "source.pdf", "Source", "/", "pdf", "large source", ["tag"])
+        await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "wiki body", ["tag"])
+
+        docs = await instance.list_documents_with_content(kb_id, wiki_content_only=True)
+        by_name = {doc["filename"]: doc for doc in docs}
+        assert by_name["source.pdf"]["content"] is None
+        assert by_name["page.md"]["content"] == "wiki body"
+
 
 class TestPages:
 
@@ -153,6 +300,18 @@ class TestPages:
         assert len(pages) == 2
         assert pages[0]["page"] == 1
 
+    async def test_get_pages_for_batch_stops_at_budget(self, fs, insert_page):
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "doc.pdf", "Doc", "/", "pdf", "", ["tag"])
+        doc_id = str(doc["id"])
+        await insert_page(doc_id, 1, "abcdefghij")
+        await insert_page(doc_id, 2, "second page")
+
+        pages = await instance.get_pages_for_batch(doc_id, 4)
+        assert len(pages) == 1
+        assert pages[0]["content"] == "abcd"
+        assert pages[0]["content_truncated"] is True
+
 
 class TestSearch:
 
@@ -164,6 +323,25 @@ class TestSearch:
         results = await instance.search_chunks(kb_id, "hello", 10)
         assert len(results) >= 1
         assert "hello" in results[0]["content"]
+
+    @pytest.mark.parametrize("query", [
+        "GPT-4", "state-of-the-art", "v1.2", "C++", "what is RLHF?", "O'Reilly", "note: x", 'unclosed "quote', "AND",
+    ])
+    async def test_search_chunks_treats_punctuation_as_plain_text(self, fs, insert_chunk, query):
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "models.md", "Models", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "GPT-4 is state-of-the-art per O'Reilly v1.2 and C++ notes")
+
+        await instance.search_chunks(kb_id, query, 5)
+
+    async def test_search_chunks_matches_hyphenated_terms(self, fs, insert_chunk):
+        instance, kb_id = fs
+        doc = await instance.create_document(kb_id, "models.md", "Models", "/", "md", "x", ["tag"])
+        await insert_chunk(str(doc["id"]), kb_id, "GPT-4 is a large language model")
+
+        results = await instance.search_chunks(kb_id, "GPT-4 model", 5)
+
+        assert any("GPT-4" in r["content"] for r in results)
 
     async def test_search_chunks_respects_limit(self, fs, insert_chunk):
         instance, kb_id = fs
@@ -210,10 +388,6 @@ class TestBytesAndDisk:
         data = await instance.load_source_bytes(doc)
         assert data == b"workspace data"
 
-    async def test_load_image_bytes_returns_none(self, fs):
-        instance, _ = fs
-        assert await instance.load_image_bytes("doc-id", "img-id") is None
-
     async def test_write_to_disk_creates_file(self, fs, workspace):
         instance, _ = fs
         result = instance.write_to_disk("/wiki/", "test.md", "content")
@@ -245,54 +419,56 @@ class TestBytesAndDisk:
 
 class TestReferences:
 
-    async def test_upsert_and_get_backlinks(self, fs):
+    async def test_get_backlinks(self, fs):
         instance, kb_id = fs
         src = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "content", ["tag"])
         target = await instance.create_document(kb_id, "source.pdf", "Source", "/", "pdf", "", ["tag"])
-        await instance.upsert_reference(str(src["id"]), str(target["id"]), kb_id, "cites", 3)
+        await instance.replace_references(str(src["id"]), kb_id, [(str(target["id"]), "cites", 3)])
 
         backlinks = await instance.get_backlinks(str(target["id"]))
         assert len(backlinks) == 1
         assert backlinks[0]["filename"] == "page.md"
         assert backlinks[0]["reference_type"] == "cites"
 
-    async def test_upsert_reference_updates_existing(self, fs):
-        instance, kb_id = fs
-        src = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "content", ["tag"])
-        target = await instance.create_document(kb_id, "source.pdf", "Source", "/", "pdf", "", ["tag"])
-        await instance.upsert_reference(str(src["id"]), str(target["id"]), kb_id, "cites", 3)
-        await instance.upsert_reference(str(src["id"]), str(target["id"]), kb_id, "cites", 7)
-
-        forward = await instance.get_forward_references(str(src["id"]))
-        assert len(forward) == 1
-
-    async def test_delete_references(self, fs):
-        instance, kb_id = fs
-        src = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "content", ["tag"])
-        target = await instance.create_document(kb_id, "source.pdf", "Source", "/", "pdf", "", ["tag"])
-        await instance.upsert_reference(str(src["id"]), str(target["id"]), kb_id, "cites", 1)
-        await instance.delete_references(str(src["id"]))
-
-        assert await instance.get_forward_references(str(src["id"])) == []
-
     async def test_get_forward_references(self, fs):
         instance, kb_id = fs
         src = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "content", ["tag"])
         t1 = await instance.create_document(kb_id, "a.pdf", "A", "/", "pdf", "", ["tag"])
         t2 = await instance.create_document(kb_id, "b.md", "B", "/wiki/", "md", "", ["tag"])
-        await instance.upsert_reference(str(src["id"]), str(t1["id"]), kb_id, "cites", 5)
-        await instance.upsert_reference(str(src["id"]), str(t2["id"]), kb_id, "links_to", None)
+        await instance.replace_references(
+            str(src["id"]), kb_id, [(str(t1["id"]), "cites", 5), (str(t2["id"]), "links_to", None)],
+        )
 
         forward = await instance.get_forward_references(str(src["id"]))
         types = {r["reference_type"] for r in forward}
         assert "cites" in types
         assert "links_to" in types
 
+    async def test_replace_references_replaces_complete_edge_set(self, fs):
+        instance, kb_id = fs
+        src = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "", ["tag"])
+        old = await instance.create_document(kb_id, "old.pdf", "Old", "/", "pdf", "", ["tag"])
+        new = await instance.create_document(kb_id, "new.pdf", "New", "/", "pdf", "", ["tag"])
+        await instance.replace_references(str(src["id"]), kb_id, [(str(old["id"]), "cites", 1)])
+
+        await instance.replace_references(
+            str(src["id"]),
+            kb_id,
+            [(str(new["id"]), "cites", 7)],
+        )
+
+        forward = await instance.get_forward_references(str(src["id"]))
+        assert [(row["filename"], row["page"]) for row in forward] == [("new.pdf", 7)]
+        edges = await instance.get_reference_edges(kb_id)
+        assert {(edge["source_id"], edge["target_id"]) for edge in edges} == {
+            (str(src["id"]), str(new["id"]))
+        }
+
     async def test_propagate_staleness(self, fs):
         instance, kb_id = fs
         target = await instance.create_document(kb_id, "target.md", "Target", "/wiki/", "md", "content", ["tag"])
         linker = await instance.create_document(kb_id, "linker.md", "Linker", "/wiki/", "md", "content", ["tag"])
-        await instance.upsert_reference(str(linker["id"]), str(target["id"]), kb_id, "links_to", None)
+        await instance.replace_references(str(linker["id"]), kb_id, [(str(target["id"]), "links_to", None)])
 
         await instance.propagate_staleness(str(target["id"]))
 
@@ -307,7 +483,7 @@ class TestReferences:
         wiki = await instance.create_document(kb_id, "page.md", "Page", "/wiki/", "md", "", ["tag"])
 
         cited = await instance.get_document(kb_id, "cited.pdf", "/")
-        await instance.upsert_reference(str(wiki["id"]), str(cited["id"]), kb_id, "cites", 1)
+        await instance.replace_references(str(wiki["id"]), kb_id, [(str(cited["id"]), "cites", 1)])
 
         uncited = await instance.find_uncited_sources(kb_id)
         filenames = [u["filename"] for u in uncited]

@@ -7,21 +7,26 @@ import { apiFetch } from '@/lib/api'
 import dynamic from 'next/dynamic'
 
 const PdfViewer = dynamic(() => import('@/components/viewer/PdfViewer'), { ssr: false })
-const HtmlViewer = dynamic(() => import('@/components/viewer/HtmlViewer'), { ssr: false })
+const MarkdownClipViewer = dynamic(
+  () => import('@/components/viewer/MarkdownClipViewer'),
+  { ssr: false },
+)
 
 function useDocumentUrl(documentId: string) {
-  const token = useUserStore((s) => s.accessToken)
+  // Depend on token presence, not its value: a refreshed token must not re-sign the URL and reload the viewer.
+  const hasToken = useUserStore((s) => Boolean(s.accessToken))
   const [url, setUrl] = React.useState<string | null>(null)
   const [error, setError] = React.useState(false)
 
   React.useEffect(() => {
+    const token = useUserStore.getState().accessToken
     if (!token) return
     let cancelled = false
     apiFetch<{ url: string }>(`/v1/documents/${documentId}/url`, token)
       .then((res) => { if (!cancelled) setUrl(res.url) })
       .catch(() => { if (!cancelled) setError(true) })
     return () => { cancelled = true }
-  }, [documentId, token])
+  }, [documentId, hasToken])
 
   return { url, error }
 }
@@ -46,7 +51,7 @@ export function PdfDocViewer({ documentId, title, initialPage, hideToolbar }: { 
   const { url, error } = useDocumentUrl(documentId)
   if (error) return <ErrorMessage message="Failed to load PDF" />
   if (!url) return <LoadingSpinner />
-  return <PdfViewer fileUrl={url} title={title} initialPage={initialPage} hideToolbar={hideToolbar} />
+  return <PdfViewer fileUrl={url} documentId={documentId} title={title} initialPage={initialPage} hideToolbar={hideToolbar} />
 }
 
 export function ImageViewer({ documentId, title }: { documentId: string; title: string }) {
@@ -62,11 +67,8 @@ export function ImageViewer({ documentId, title }: { documentId: string; title: 
   )
 }
 
-export function HtmlDocViewer({ documentId, title }: { documentId: string; title: string }) {
-  const { url, error } = useDocumentUrl(documentId)
-  if (error) return <ErrorMessage message="Failed to load HTML" />
-  if (!url) return <LoadingSpinner />
-  return <HtmlViewer fileUrl={url} className="h-full" />
+export function HtmlDocViewer({ documentId, title: _title }: { documentId: string; title: string }) {
+  return <MarkdownClipViewer documentId={documentId} className="h-full" />
 }
 
 export function ContentViewer({ documentId, title, fileType }: { documentId: string; title: string; fileType: string }) {

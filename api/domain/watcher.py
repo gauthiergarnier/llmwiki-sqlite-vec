@@ -1,24 +1,15 @@
-"""Filesystem watcher for local mode.
-
-Watches the workspace for file changes and updates the SQLite index.
-Uses watchfiles for efficient cross-platform filesystem monitoring.
-
-Key design rules:
-- App-initiated writes register in _recently_written to prevent re-indexing loops
-- Hidden dirs (.llmwiki, .git, node_modules, etc.) are ignored
-- File identity is by path — rename = delete old + create new
-"""
+"""Local-mode filesystem watcher; file identity is by path, so a rename is delete + create."""
 
 import asyncio
+import contextlib
 import hashlib
-import json
 import logging
-import os
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import aiosqlite
+from domain.file_types import PROCESSING_TYPES, SIMPLE_TEXT_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -27,12 +18,8 @@ IGNORE_DIRS = frozenset({
     ".idea", ".vscode", ".DS_Store",
 })
 
-TEXT_EXTENSIONS = frozenset({
-    "md", "txt", "csv", "html", "svg", "json", "xml", "yaml", "yml",
-    "toml", "ini", "cfg", "rst", "tex", "latex",
-})
-
 COOLDOWN_SECONDS = 2.0
+MAX_HASH_SIZE_BYTES = 100_000_000
 
 _ignore_patterns: list[str] | None = None
 
@@ -51,7 +38,7 @@ def _load_ignore_patterns(workspace: Path) -> list[str]:
                 line = line.strip()
                 if line and not line.startswith("#"):
                     patterns.append(line)
-            break  # Use first found, don't merge
+            break
     _ignore_patterns = patterns
     return patterns
 
@@ -65,13 +52,12 @@ def _matches_ignore_pattern(relative: str, patterns: list[str]) -> bool:
             return True
         if fnmatch(relative, f"**/{pattern}"):
             return True
-        # Check if any path component matches a directory pattern
         for part in relative.split("/"):
             if fnmatch(part, pattern):
                 return True
     return False
 
-# Paths written by the app — skip re-indexing for these
+# App-initiated writes, skipped by the watcher to avoid re-indexing loops.
 _recently_written: dict[str, float] = {}
 
 
@@ -89,27 +75,32 @@ def _is_recently_written(path: str) -> bool:
     return False
 
 
-def _should_ignore(path: Path, workspace: Path) -> bool:
+def _should_ignore(
+    path: Path,
+    workspace: Path,
+    patterns: list[str] | None = None,
+) -> bool:
     """Check if a path should be ignored based on directory rules + ignore files."""
     try:
         relative = path.relative_to(workspace)
     except ValueError:
         return True
 
-    relative_str = str(relative)
+    relative_str = relative.as_posix()
     parts = relative.parts
 
-    # Built-in ignores
     for part in parts:
         if part in IGNORE_DIRS or part.startswith("."):
             return True
 
-    # User-configured ignore patterns
-    patterns = _load_ignore_patterns(workspace)
-    if patterns and _matches_ignore_pattern(relative_str, patterns):
-        return True
+    if patterns is None:
+        patterns = _load_ignore_patterns(workspace)
+    return bool(patterns and _matches_ignore_pattern(relative_str, patterns))
 
-    return False
+
+def _workspace_relative(file_path: PurePath, workspace: PurePath) -> str:
+    """Workspace-relative path with forward slashes on every platform."""
+    return file_path.relative_to(workspace).as_posix()
 
 
 def _get_source_kind(relative_path: str) -> str:
@@ -118,9 +109,29 @@ def _get_source_kind(relative_path: str) -> str:
     return "source"
 
 
+def _read_file_snapshot(file_path: Path, include_content: bool):
+    """Read filesystem metadata/content/hash without blocking the event loop."""
+    stat = file_path.stat()
+
+    content = None
+    if include_content:
+        with contextlib.suppress(OSError):
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+
+    content_hash = None
+    if stat.st_size < MAX_HASH_SIZE_BYTES:
+        with contextlib.suppress(OSError):
+            digest = hashlib.sha256()
+            with file_path.open("rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            content_hash = digest.hexdigest()
+
+    return stat, content, content_hash
+
+
 async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path) -> None:
-    """Index or re-index a single file."""
-    relative = str(file_path.relative_to(workspace))
+    relative = _workspace_relative(file_path, workspace)
     filename = file_path.name
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
@@ -131,39 +142,32 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
         dir_path = "/"
 
     source_kind = _get_source_kind(relative)
-    stat = file_path.stat()
 
-    # Derive title
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
     title = stem.replace("-", " ").replace("_", " ").strip().title()
 
-    # Read content for text files
-    content = None
-    if ext in TEXT_EXTENSIONS:
-        try:
-            content = file_path.read_text(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+    stat, content, content_hash = await asyncio.to_thread(
+        _read_file_snapshot,
+        file_path,
+        ext in SIMPLE_TEXT_TYPES,
+    )
 
-    content_hash = None
-    if stat.st_size < 100_000_000:
-        try:
-            content_hash = hashlib.sha256(file_path.read_bytes()).hexdigest()
-        except Exception:
-            pass
-
-    # Check if document already exists at this path
     cursor = await db.execute(
-        "SELECT id, content_hash FROM documents WHERE relative_path = ?",
+        "SELECT id, content_hash, file_size, mtime_ns FROM documents WHERE relative_path = ?",
         (relative,),
     )
     existing = await cursor.fetchone()
 
     if existing:
-        doc_id, old_hash = existing
-        if old_hash == content_hash:
-            return  # No change
-        # Update existing
+        doc_id, old_hash, old_size, old_mtime_ns = existing
+        hash_matches = content_hash is not None and old_hash == content_hash
+        metadata_matches = (
+            content_hash is None
+            and old_size == stat.st_size
+            and old_mtime_ns == int(stat.st_mtime_ns)
+        )
+        if hash_matches or metadata_matches:
+            return
         await db.execute(
             "UPDATE documents SET content = ?, file_size = ?, content_hash = ?, "
             "mtime_ns = ?, last_indexed_at = datetime('now'), "
@@ -173,46 +177,63 @@ async def _index_file(db: aiosqlite.Connection, workspace: Path, file_path: Path
         )
         await db.commit()
         logger.info("Re-indexed (modified): %s", relative)
-        # Re-process non-text files
-        if ext not in TEXT_EXTENSIONS and ext:
-            from domain.local_processor import process_document as _process
-            import asyncio
-            asyncio.create_task(_process(db, doc_id, workspace))
+        if ext in PROCESSING_TYPES:
+            await db.execute(
+                "UPDATE documents SET status = 'pending', parser = NULL, error_message = NULL, "
+                "updated_at = datetime('now') WHERE id = ?",
+                (doc_id,),
+            )
+            await db.commit()
+            from domain.local_processor import process_document_isolated
+            asyncio.create_task(process_document_isolated(workspace, doc_id))
+        elif content is not None:
+            from domain.local_processor import chunk_text_document
+            await chunk_text_document(db, doc_id, content)
+        else:
+            # No extractor can make unknown binaries searchable; finalize without a background job.
+            await db.execute(
+                "UPDATE documents SET status = 'ready', parser = 'native', "
+                "error_message = NULL, updated_at = datetime('now') WHERE id = ?",
+                (doc_id,),
+            )
+            await db.commit()
         return
-    else:
-        # Create new
-        doc_id = str(uuid.uuid4())
-        cursor = await db.execute(
-            "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents",
-        )
-        row = await cursor.fetchone()
-        doc_number = row[0]
 
-        status = "ready" if content is not None else "pending"
-        await db.execute(
-            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
-            "source_kind, file_type, file_size, status, content, tags, version, "
-            "content_hash, mtime_ns, last_indexed_at, document_number) "
-            "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, "
-            "?, ?, '[]', 0, ?, ?, datetime('now'), ?)",
-            (doc_id, filename, title, dir_path, relative, source_kind,
-             ext or "bin", stat.st_size, status, content, content_hash,
-             int(stat.st_mtime_ns), doc_number),
-        )
-        logger.info("Indexed (new): %s", relative)
-        # Process non-text files (PDFs, spreadsheets, images, HTML)
-        if status == "pending":
-            from domain.local_processor import process_document as _process
-            import asyncio
-            asyncio.create_task(_process(db, doc_id, workspace))
+    doc_id = str(uuid.uuid4())
+    cursor = await db.execute(
+        "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents",
+    )
+    row = await cursor.fetchone()
+    doc_number = row[0]
 
+    needs_processing = ext in PROCESSING_TYPES
+    status = "pending" if needs_processing else "ready"
+    parser = "native" if content is None and not needs_processing else None
+    await db.execute(
+        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, "
+        "source_kind, file_type, file_size, status, content, tags, version, "
+        "content_hash, mtime_ns, last_indexed_at, document_number, parser) "
+        "VALUES (?, (SELECT user_id FROM workspace LIMIT 1), ?, ?, ?, ?, ?, ?, ?, "
+        "?, ?, '[]', 0, ?, ?, datetime('now'), ?, ?)",
+        (doc_id, filename, title, dir_path, relative, source_kind,
+         ext or "bin", stat.st_size, status, content, content_hash,
+         int(stat.st_mtime_ns), doc_number, parser),
+    )
+    logger.info("Indexed (new): %s", relative)
+    # Commit before spawning: the processor's own connection must see the row to claim it.
     await db.commit()
+    if status == "pending":
+        from domain.local_processor import process_document_isolated
+        asyncio.create_task(process_document_isolated(workspace, doc_id))
+
+    if status == "ready" and content is not None:
+        from domain.local_processor import chunk_text_document
+        await chunk_text_document(db, doc_id, content)
 
 
 async def _remove_file(db: aiosqlite.Connection, workspace: Path, file_path: Path) -> None:
-    """Remove a file from the index."""
     try:
-        relative = str(file_path.relative_to(workspace))
+        relative = _workspace_relative(file_path, workspace)
     except ValueError:
         return
 
@@ -225,24 +246,24 @@ async def _remove_file(db: aiosqlite.Connection, workspace: Path, file_path: Pat
 
 
 async def watch_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
-    """Watch the workspace for file changes and update the SQLite index.
-
-    Runs indefinitely as an async task. Cancel to stop.
-    """
-    from watchfiles import awatch, Change
+    """Sync workspace file changes into the SQLite index until cancelled."""
+    from watchfiles import Change, awatch
 
     logger.info("File watcher started: %s", workspace)
+    ignore_patterns = await asyncio.to_thread(_load_ignore_patterns, workspace)
 
     async for changes in awatch(
         str(workspace),
-        watch_filter=lambda change, path: not _should_ignore(Path(path), workspace),
+        watch_filter=lambda change, path: not _should_ignore(
+            Path(path), workspace, ignore_patterns,
+        ),
         debounce=500,
         step=200,
     ):
         for change_type, path_str in changes:
             path = Path(path_str)
 
-            if _should_ignore(path, workspace):
+            if _should_ignore(path, workspace, ignore_patterns):
                 continue
 
             if _is_recently_written(path_str):
@@ -250,14 +271,13 @@ async def watch_workspace(db: aiosqlite.Connection, workspace: Path) -> None:
 
             try:
                 if change_type == Change.added or change_type == Change.modified:
-                    if path.is_file():
+                    if await asyncio.to_thread(path.is_file):
                         await _index_file(db, workspace, path)
                 elif change_type == Change.deleted:
                     await _remove_file(db, workspace, path)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 -- watcher must survive per-file failures
                 logger.warning("Watcher error for %s: %s", path_str, e)
 
-        # Clean up expired entries from _recently_written
         now = time.monotonic()
         expired = [k for k, v in _recently_written.items() if now - v > COOLDOWN_SECONDS * 2]
         for k in expired:

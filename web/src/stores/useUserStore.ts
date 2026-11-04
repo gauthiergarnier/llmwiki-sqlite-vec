@@ -1,5 +1,4 @@
 import { create } from 'zustand'
-import { persist } from 'zustand/middleware'
 
 type User = {
   id: string
@@ -18,22 +17,14 @@ type UserState = {
   signOut: () => void
 }
 
-export const useUserStore = create<UserState>()(
-  persist(
-    (set) => ({
-      user: null,
-      accessToken: null,
-      authLoading: true,
-      onboarded: null,
-      setUser: (user) => set({ user }),
-      setAccessToken: (accessToken) => set({ accessToken }),
-      setAuthLoading: (authLoading) => set({ authLoading }),
-      setOnboarded: (onboarded) => set({ onboarded }),
-      signOut: () => set({ user: null, accessToken: null, authLoading: false, onboarded: null }),
-    }),
-    {
-      name: 'llmwiki:user',
-      partialize: (state) => ({ accessToken: state.accessToken }),
-    },
-  ),
-)
+export const useUserStore = create<UserState>()((set) => ({
+  user: null,
+  accessToken: null,
+  authLoading: true,
+  onboarded: null,
+  setUser: (user) => set({ user }),
+  setAccessToken: (accessToken) => set({ accessToken }),
+  setAuthLoading: (authLoading) => set({ authLoading }),
+  setOnboarded: (onboarded) => set({ onboarded }),
+  signOut: () => set({ user: null, accessToken: null, authLoading: false, onboarded: null }),
+}))

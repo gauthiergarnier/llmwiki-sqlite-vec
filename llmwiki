@@ -1,22 +1,13 @@
 #!/usr/bin/env python3
-"""LLM Wiki — local-first knowledge workspace CLI.
-
-Usage:
-    llmwiki open <workspace>         Init if needed + serve + open browser
-    llmwiki init <workspace>         Create .llmwiki/ + wiki/, index files
-    llmwiki serve <workspace>        Start API + web on localhost
-    llmwiki mcp <workspace>          Run stdio MCP server (for Claude config)
-    llmwiki mcp-config <workspace>   Print claude_desktop_config.json snippet
-    llmwiki reindex <workspace>      Force full rebuild of index.db
-"""
+"""LLM Wiki local-first workspace CLI; `llmwiki -h` lists the commands."""
 
 import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
+import time
 import webbrowser
 from pathlib import Path
 
@@ -24,22 +15,22 @@ REPO_ROOT = Path(__file__).resolve().parent
 API_DIR = REPO_ROOT / "api"
 MCP_DIR = REPO_ROOT / "mcp"
 WEB_DIR = REPO_ROOT / "web"
-VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+VENV_PYTHON = REPO_ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 # Guard env var: set on the re-exec'd process so it can't loop.
 _REEXEC_FLAG = "LLMWIKI_VENV_REEXEC"
 
 
 def _reexec_in_venv() -> None:
-    """Hand off to the project venv when invoked with another interpreter.
+    """Hand off to the project venv when invoked with another interpreter (fork).
 
     Subcommands spawn uvicorn and the MCP server with ``sys.executable``, so
     running ``./llmwiki`` without the venv active (the shebang picks whatever
     ``python3`` is on PATH) starts an interpreter with no dependencies
-    installed. Same for the ``mcp-config`` snippet, which points Claude at
-    this script directly.
+    installed — and reindex's best-effort steps then silently no-op. POSIX only:
+    on Windows ``os.execv`` spawns a detached child instead of replacing us.
     """
-    if os.environ.get(_REEXEC_FLAG) or not VENV_PYTHON.exists():
+    if os.name == "nt" or os.environ.get(_REEXEC_FLAG) or not VENV_PYTHON.exists():
         return
     if Path(sys.executable).resolve() == VENV_PYTHON.resolve():
         return
@@ -50,6 +41,15 @@ def _reexec_in_venv() -> None:
 
 
 _reexec_in_venv()
+
+
+def _load_migration_runner():
+    import importlib.util
+    path = API_DIR / "infra" / "db" / "local_migrations.py"
+    spec = importlib.util.spec_from_file_location("local_migrations", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _sanitize_name(name: str) -> str:
@@ -72,15 +72,10 @@ def cmd_init(workspace: str) -> None:
         print(f"  index.db: {db_path}")
         return
 
-    # Initialize SQLite
     import sqlite3
-    schema_path = API_DIR / "infra" / "db" / "sqlite_schema.sql"
-    if not schema_path.exists():
-        print(f"Error: schema not found at {schema_path}", file=sys.stderr)
-        sys.exit(1)
+    _load_migration_runner().apply_migrations(str(db_path))
 
     conn = sqlite3.connect(str(db_path))
-    conn.executescript(schema_path.read_text())
 
     import uuid
     user_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, "local"))
@@ -92,7 +87,6 @@ def cmd_init(workspace: str) -> None:
         (ws_id, ws_name, user_id),
     )
 
-    # Scaffold wiki pages
     doc1_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
@@ -100,44 +94,28 @@ def cmd_init(workspace: str) -> None:
         "VALUES (?, ?, 'overview.md', 'Overview', '/wiki/', 'wiki/overview.md', 'wiki', "
         "'md', 'ready', ?, '[]', 0, 1)",
         (doc1_id, user_id,
-         f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet.\n\n## Recent Updates\n\nNo activity yet."),
-    )
-
-    doc2_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-        "file_type, status, content, tags, version, document_number) "
-        "VALUES (?, ?, 'log.md', 'Log', '/wiki/', 'wiki/log.md', 'wiki', "
-        "'md', 'ready', ?, '[]', 0, 2)",
-        (doc2_id, user_id, "Chronological record of ingests, queries, and maintenance passes."),
+         f"This wiki tracks research on {ws_name}.\n\n## Key Findings\n\nNo sources ingested yet."),
     )
 
     conn.commit()
     conn.close()
 
-    # Write actual wiki files
     overview = ws / "wiki" / "overview.md"
     if not overview.exists():
         overview.write_text(
             f"This wiki tracks research on {ws_name}.\n\n"
-            "## Key Findings\n\nNo sources ingested yet.\n\n"
-            "## Recent Updates\n\nNo activity yet.\n"
+            "## Key Findings\n\nNo sources ingested yet.\n",
+            encoding="utf-8",
         )
 
-    log = ws / "wiki" / "log.md"
-    if not log.exists():
-        log.write_text("Chronological record of ingests, queries, and maintenance passes.\n")
-
-    # Index existing files
-    _index_existing_files(ws, db_path, user_id, ws_id)
+    _index_existing_files(ws, db_path, user_id)
 
     print(f"✓ Initialized workspace: {ws}")
     print(f"  wiki/overview.md — created")
-    print(f"  wiki/log.md — created")
     print(f"  .llmwiki/index.db — created")
 
 
-def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> None:
+def _index_existing_files(ws: Path, db_path: Path, user_id: str) -> None:
     """Index existing files in the workspace into SQLite."""
     import hashlib
     import uuid
@@ -148,12 +126,10 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
 
     conn = sqlite3.connect(str(db_path))
 
-    # Get already-indexed paths
     cursor = conn.execute("SELECT relative_path FROM documents")
     existing = {row[0] for row in cursor.fetchall()}
 
     for root_path, dirs, files in os.walk(ws):
-        # Skip ignored directories
         dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
 
         for filename in files:
@@ -161,7 +137,7 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
                 continue
 
             full = Path(root_path) / filename
-            relative = str(full.relative_to(ws))
+            relative = full.relative_to(ws).as_posix()
 
             if relative in existing:
                 continue
@@ -169,7 +145,6 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
             ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
             stat = full.stat()
 
-            # Determine path (directory) and source_kind
             parts = relative.split("/")
             if len(parts) > 1:
                 dir_path = "/" + "/".join(parts[:-1]) + "/"
@@ -177,13 +152,15 @@ def _index_existing_files(ws: Path, db_path: Path, user_id: str, ws_id: str) -> 
                 dir_path = "/"
             source_kind = "wiki" if relative.startswith("wiki/") else "source"
 
-            # Derive title
             stem = filename.rsplit(".", 1)[0] if "." in filename else filename
             title = stem.replace("-", " ").replace("_", " ").strip().title()
 
-            # Read content for text files
+            # Keep in sync with domain.file_types.SIMPLE_TEXT_TYPES
             content = None
-            text_types = {"md", "txt", "csv", "html", "svg", "json", "xml"}
+            text_types = {
+                "md", "txt", "csv", "svg", "json", "xml",
+                "yaml", "yml", "toml", "ini", "cfg", "rst", "tex", "latex",
+            }
             if ext in text_types:
                 try:
                     content = full.read_text(encoding="utf-8", errors="replace")
@@ -234,37 +211,60 @@ def cmd_serve(workspace: str, open_browser: bool = True) -> None:
     print(f"  MCP: llmwiki mcp-config {ws}")
     print()
 
-    # Start API server
     api_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "8000"],
         cwd=str(API_DIR),
         env=env,
     )
 
-    # Start web dev server
     web_env = env.copy()
     web_env["NEXT_PUBLIC_MODE"] = "local"
     web_env["NEXT_PUBLIC_API_URL"] = "http://localhost:8000"
-    npm = shutil.which("pnpm") or shutil.which("npm")
+    next_bin = WEB_DIR / "node_modules" / ".bin" / ("next.cmd" if os.name == "nt" else "next")
+    if not next_bin.exists():
+        print(
+            f"Error: web dependencies not installed. Install Node.js 20+, then run: "
+            f"cd {WEB_DIR} && npm install",
+            file=sys.stderr,
+        )
+        api_proc.terminate()
+        sys.exit(1)
+    # Loopback only: the dev server proxies /api and /mcp to the unauthenticated local API.
     web_proc = subprocess.Popen(
-        [npm, "run", "dev"],
+        [str(next_bin), "dev", "--webpack", "--port", "3000", "--hostname", "127.0.0.1"],
         cwd=str(WEB_DIR),
         env=web_env,
     )
 
-    if open_browser:
-        import time
-        time.sleep(3)
-        webbrowser.open("http://localhost:3000/wikis")
+    _supervise(api_proc, web_proc, open_browser)
 
+
+def _supervise(api_proc: subprocess.Popen, web_proc: subprocess.Popen, open_browser: bool) -> None:
+    """Run until either server exits or the user interrupts, then stop both."""
     try:
-        api_proc.wait()
+        if open_browser:
+            time.sleep(3)
+            webbrowser.open("http://localhost:3000/wikis")
+        while True:
+            time.sleep(0.5)
+            if api_proc.poll() is not None:
+                print("\nAPI server exited — shutting down web server.", file=sys.stderr)
+                break
+            if web_proc.poll() is not None:
+                print("\nWeb server exited — shutting down API server.", file=sys.stderr)
+                break
     except KeyboardInterrupt:
         print("\nShutting down...")
-        api_proc.terminate()
-        web_proc.terminate()
-        api_proc.wait()
-        web_proc.wait()
+    finally:
+        for proc in (api_proc, web_proc):
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in (api_proc, web_proc):
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
 
 
 def cmd_open(workspace: str) -> None:
@@ -279,12 +279,13 @@ def cmd_mcp(workspace: str) -> None:
     if not (ws / ".llmwiki" / "index.db").exists():
         cmd_init(str(ws))
 
-    # local_server uses top-level absolute imports, so it only resolves from mcp/
-    os.chdir(MCP_DIR)
-    os.execvp(
-        sys.executable,
-        [sys.executable, "-m", "local_server", "--workspace", str(ws)],
-    )
+    # Claude Desktop launches with cwd=~, so chdir for `-m local_server` to resolve.
+    os.chdir(str(MCP_DIR))
+    cmd = [sys.executable, "-m", "local_server", "--workspace", str(ws)]
+    # Windows os.exec* detaches from the parent process, breaking Claude Desktop's stdio lifecycle.
+    if sys.platform == "win32":
+        sys.exit(subprocess.call(cmd))
+    os.execvp(sys.executable, cmd)
 
 
 def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
@@ -292,11 +293,12 @@ def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
     server_name = name or f"llmwiki-{_sanitize_name(ws.name)}"
     llmwiki_path = str(REPO_ROOT / "llmwiki")
 
+    # The current interpreter: shebangs fail on Windows and Claude Desktop won't activate the venv.
     config = {
         "mcpServers": {
             server_name: {
-                "command": llmwiki_path,
-                "args": ["mcp", str(ws)],
+                "command": sys.executable,
+                "args": [llmwiki_path, "mcp", str(ws)],
             }
         }
     }
@@ -308,93 +310,26 @@ def cmd_mcp_config(workspace: str, name: str | None = None) -> None:
     print(json.dumps(config, indent=2))
 
 
-def _reparse_references(ws: Path) -> None:
-    """Rebuild the citation/link graph after a reindex.
-
-    Reindex reassigns document ids, so any reference edges stored earlier point
-    at dead ids. Re-run the canonical reference parser (mcp/tools/references.py)
-    over every wiki page to rebuild document_references against the new ids.
-    Best-effort: needs the project venv (aiosqlite, sqlite-vec). If those can't
-    be imported, the reindex still succeeds — just without the graph.
-    """
-    import asyncio
-    import uuid
-
-    sys.path.insert(0, str(MCP_DIR))
-    try:
-        from vaultfs import SqliteVaultFS
-        from tools.references import update_references
-    except Exception as exc:  # deps missing — degrade gracefully
-        print(f"  (reference graph not rebuilt — run from the project venv: {exc})",
-              file=sys.stderr)
-        return
-
-    async def _run() -> None:
-        await SqliteVaultFS.init(str(ws))
-        try:
-            fs = SqliteVaultFS(str(uuid.uuid5(uuid.NAMESPACE_DNS, "local")))
-            kb = await fs.resolve_kb("")
-            if not kb:
-                return
-            db = SqliteVaultFS._db_or_raise()
-            await db.execute("DELETE FROM document_references")  # clear any stale edges
-            await db.commit()
-            docs = await fs.list_documents_with_content(kb["id"])
-            parsed = 0
-            for doc in docs:
-                if str(doc.get("path", "")).startswith("/wiki") and (doc.get("content") or "").strip():
-                    await update_references(fs, kb["id"], str(doc["id"]), doc["content"], doc["path"])
-                    parsed += 1
-            print(f"  ✓ Reference graph rebuilt ({parsed} wiki pages)")
-        finally:
-            await SqliteVaultFS.close()
-
-    asyncio.run(_run())
-
-
-def _rebuild_chunks(ws: Path) -> None:
-    """Rebuild document_chunks + embeddings after a reindex.
-
-    The indexer stores document rows but does not chunk markdown/text content,
-    so without this the hybrid search (FTS5 + sqlite-vec) has nothing to match.
-    Runs the backfill in the api/ context as a subprocess — its imports (config,
-    services, domain) collide with the mcp/ package, so it must not share this
-    process. Best-effort: needs the project venv.
-    """
-    import subprocess
-
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "backfill_chunks", str(ws)],
-            cwd=str(API_DIR),
-        )
-    except Exception as exc:
-        print(f"  (chunks not rebuilt — {exc})", file=sys.stderr)
-        return
-    if result.returncode != 0:
-        print("  (chunks not rebuilt — run from the project venv to enable search)",
-              file=sys.stderr)
-
-
-def cmd_reindex(workspace: str) -> None:
+def cmd_reindex(workspace: str, assume_yes: bool) -> None:
     ws = Path(workspace).resolve()
     db_path = ws / ".llmwiki" / "index.db"
     if not db_path.exists():
         print(f"No index found. Run: llmwiki init {ws}", file=sys.stderr)
         sys.exit(1)
+    if not assume_yes and not _confirm_reindex():
+        sys.exit(1)
 
-    # Drop and recreate document-related tables. foreign_keys=ON so the
-    # DELETE cascades into document_references (et al.) instead of leaving
-    # orphaned edges that point at the about-to-be-reassigned document ids.
+    backup_path = _backup_index(db_path)
+    print(f"Backed up the current index to {backup_path}", file=sys.stderr)
+
     import sqlite3
     conn = sqlite3.connect(str(db_path))
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("DELETE FROM document_references")
     conn.execute("DELETE FROM document_chunks")
     conn.execute("DELETE FROM document_pages")
     conn.execute("DELETE FROM documents")
     conn.commit()
 
-    # Get workspace info
     cursor = conn.execute("SELECT id, user_id FROM workspace LIMIT 1")
     row = cursor.fetchone()
     if not row:
@@ -403,10 +338,55 @@ def cmd_reindex(workspace: str) -> None:
     ws_id, user_id = row
     conn.close()
 
-    _index_existing_files(ws, db_path, user_id, ws_id)
-    _rebuild_chunks(ws)
-    _reparse_references(ws)
+    _index_existing_files(ws, db_path, user_id)
+    _finish_reindex(ws)
     print(f"✓ Reindexed workspace: {ws}")
+
+
+def _finish_reindex(ws: Path) -> None:
+    """Chunk, rebuild the reference graph, and embed — so search works without `serve` (fork).
+
+    Runs api/reindex_finish.py in the api/ import context as a subprocess (its
+    `config`/`services` packages collide with mcp/'s). Best-effort: on failure the
+    index is still valid and `serve` will chunk on startup, but the graph stays
+    empty — so say so loudly instead of exiting 0 silently.
+    """
+    try:
+        result = subprocess.run([sys.executable, "-m", "reindex_finish", str(ws)], cwd=str(API_DIR))
+    except Exception as exc:
+        print(f"  ⚠ Chunks / graph / embeddings not rebuilt — {exc}", file=sys.stderr)
+        return
+    if result.returncode != 0:
+        print(
+            "  ⚠ Chunks / graph / embeddings not rebuilt (see errors above). "
+            "Run from the project venv: .venv/bin/python llmwiki reindex …",
+            file=sys.stderr,
+        )
+
+
+def _confirm_reindex() -> bool:
+    """Ask before discarding index-only state (highlights, comments, replies, course progress, metadata)."""
+    warning = (
+        "Reindex rebuilds search from your files but DISCARDS highlights, comments, agent replies,\n"
+        "course/quiz progress and clip metadata, which live only in .llmwiki/index.db."
+    )
+    print(warning, file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("Re-run with --yes to confirm.", file=sys.stderr)
+        return False
+    return input("Continue? [y/N] ").strip().lower() in ("y", "yes")
+
+
+def _backup_index(db_path: Path) -> Path:
+    import sqlite3
+    backup_path = db_path.with_name(f"index.db.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+    source = sqlite3.connect(str(db_path))
+    target = sqlite3.connect(str(backup_path))
+    with target:
+        source.backup(target)
+    source.close()
+    target.close()
+    return backup_path
 
 
 def main():
@@ -434,6 +414,7 @@ def main():
 
     p_reindex = sub.add_parser("reindex", help="Force full rebuild of index")
     p_reindex.add_argument("workspace", help="Path to workspace folder")
+    p_reindex.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
 
     args = parser.parse_args()
 
@@ -450,9 +431,9 @@ def main():
     elif args.command == "mcp":
         cmd_mcp(args.workspace)
     elif args.command == "mcp-config":
-        cmd_mcp_config(args.workspace, getattr(args, "name", None))
+        cmd_mcp_config(args.workspace, args.name)
     elif args.command == "reindex":
-        cmd_reindex(args.workspace)
+        cmd_reindex(args.workspace, args.yes)
 
 
 if __name__ == "__main__":

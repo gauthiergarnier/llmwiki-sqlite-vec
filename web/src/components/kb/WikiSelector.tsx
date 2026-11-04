@@ -2,11 +2,15 @@
 
 import * as React from 'react'
 import { useRouter } from 'next/navigation'
-import { ChevronsUpDown, Plus, Pencil, Trash2 } from 'lucide-react'
+import { Check, ChevronDown, Plus, Pencil, Trash2, Library, GraduationCap, BookOpen } from 'lucide-react'
+import { toast } from 'sonner'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
 import { Command, CommandInput, CommandList, CommandItem, CommandEmpty, CommandGroup, CommandSeparator } from '@/components/ui/command'
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { ConfirmDialog } from '@/components/dialogs/ConfirmDialog'
+import { NameDialog } from '@/components/dialogs/NameDialog'
 import { useKBStore } from '@/stores'
+
+const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
 
 export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string }) {
   const router = useRouter()
@@ -14,16 +18,27 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
   const createKB = useKBStore((s) => s.createKB)
   const renameKB = useKBStore((s) => s.renameKB)
   const deleteKB = useKBStore((s) => s.deleteKB)
+  const setKBKind = useKBStore((s) => s.setKBKind)
+  const isCourse = knowledgeBases.find((kb) => kb.id === kbId)?.kind === 'course'
   const [open, setOpen] = React.useState(false)
   const [search, setSearch] = React.useState('')
   const [createDialogOpen, setCreateDialogOpen] = React.useState(false)
   const [renameDialogOpen, setRenameDialogOpen] = React.useState(false)
+  const [convertDialogOpen, setConvertDialogOpen] = React.useState(false)
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [newName, setNewName] = React.useState('')
   const [renameName, setRenameName] = React.useState('')
   const [creating, setCreating] = React.useState(false)
   const [renaming, setRenaming] = React.useState(false)
+  const [converting, setConverting] = React.useState(false)
   const [deleting, setDeleting] = React.useState(false)
+  const triggerRef = React.useRef<HTMLButtonElement>(null)
+
+  // The popover unmounts before the dialog opens, so Radix would restore focus to <body>.
+  const restoreFocusToTrigger = React.useCallback((event: Event) => {
+    event.preventDefault()
+    triggerRef.current?.focus()
+  }, [])
 
   const handleCreate = async () => {
     if (!newName.trim()) return
@@ -34,7 +49,7 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
       setNewName('')
       router.push(`/wikis/${kb.slug}`)
     } catch {
-      // error handled by store
+      toast.error('Failed to create wiki')
     } finally {
       setCreating(false)
     }
@@ -49,9 +64,21 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
       const updated = useKBStore.getState().knowledgeBases.find((kb) => kb.id === kbId)
       if (updated) router.replace(`/wikis/${updated.slug}`)
     } catch {
-      // error handled by store
+      toast.error('Failed to rename wiki')
     } finally {
       setRenaming(false)
+    }
+  }
+
+  const handleConvert = async () => {
+    setConverting(true)
+    try {
+      await setKBKind(kbId, isCourse ? 'wiki' : 'course')
+      setConvertDialogOpen(false)
+    } catch {
+      toast.error(isCourse ? 'Failed to convert to wiki' : 'Failed to convert to course')
+    } finally {
+      setConverting(false)
     }
   }
 
@@ -62,7 +89,7 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
       setDeleteDialogOpen(false)
       router.push('/wikis')
     } catch {
-      // error handled by store
+      toast.error('Failed to delete wiki')
     } finally {
       setDeleting(false)
     }
@@ -73,19 +100,20 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
       <Popover open={open} onOpenChange={(v) => { setOpen(v); if (!v) setSearch('') }}>
         <PopoverTrigger asChild>
           <button
+            ref={triggerRef}
             role="combobox"
             aria-expanded={open}
             aria-label="Switch wiki"
-            className="flex items-center gap-1.5 w-full px-2 py-1.5 text-sm font-medium text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 w-full px-2 py-1.5 text-sm font-semibold text-foreground hover:bg-sidebar-accent rounded-md transition-colors cursor-pointer"
           >
             <span className="truncate flex-1 text-left">{kbName}</span>
-            <ChevronsUpDown className="size-3 text-muted-foreground/50 shrink-0" />
+            <ChevronDown className="size-3.5 text-muted-foreground/40 shrink-0" />
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-52 p-0" align="start">
+        <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0" align="start">
           <Command>
             <CommandInput placeholder="Search wikis..." aria-label="Search wikis" value={search} onValueChange={setSearch} />
-            <CommandList>
+            <CommandList className="max-h-[min(60vh,26rem)]">
               <CommandEmpty>No wikis found.</CommandEmpty>
               <CommandGroup heading="Wikis">
                 {knowledgeBases.map((kb) => (
@@ -97,7 +125,8 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
                       router.push(`/wikis/${kb.slug}`)
                     }}
                   >
-                    {kb.name}
+                    <span className="truncate flex-1">{kb.name}</span>
+                    {kb.id === kbId && <Check className="size-3.5 shrink-0 text-muted-foreground" />}
                   </CommandItem>
                 ))}
               </CommandGroup>
@@ -105,6 +134,15 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
                 <>
                   <CommandSeparator />
                   <CommandGroup heading="Actions">
+                    <CommandItem
+                      onSelect={() => {
+                        setOpen(false)
+                        router.push('/wikis')
+                      }}
+                    >
+                      <Library className="size-3.5 mr-2" />
+                      View all wikis
+                    </CommandItem>
                     <CommandItem
                       onSelect={() => {
                         setOpen(false)
@@ -118,23 +156,38 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
                     <CommandItem
                       onSelect={() => {
                         setOpen(false)
-                        setDeleteDialogOpen(true)
-                      }}
-                      className="text-destructive"
-                    >
-                      <Trash2 className="size-3.5 mr-2" />
-                      Delete
-                    </CommandItem>
-                    <CommandSeparator />
-                    <CommandItem
-                      onSelect={() => {
-                        setOpen(false)
-                        setCreateDialogOpen(true)
+                        setConvertDialogOpen(true)
                       }}
                     >
-                      <Plus className="size-3.5 mr-2" />
-                      Create Wiki
+                      {isCourse
+                        ? <BookOpen className="size-3.5 mr-2" />
+                        : <GraduationCap className="size-3.5 mr-2" />}
+                      {isCourse ? 'Convert to wiki' : 'Convert to course'}
                     </CommandItem>
+                    {!isLocal && (
+                      <>
+                        <CommandItem
+                          onSelect={() => {
+                            setOpen(false)
+                            setDeleteDialogOpen(true)
+                          }}
+                          className="text-destructive"
+                        >
+                          <Trash2 className="size-3.5 mr-2" />
+                          Delete
+                        </CommandItem>
+                        <CommandSeparator />
+                        <CommandItem
+                          onSelect={() => {
+                            setOpen(false)
+                            setCreateDialogOpen(true)
+                          }}
+                        >
+                          <Plus className="size-3.5 mr-2" />
+                          Create wiki
+                        </CommandItem>
+                      </>
+                    )}
                   </CommandGroup>
                 </>
               )}
@@ -143,80 +196,65 @@ export function WikiSelector({ kbName, kbId }: { kbName: string; kbId: string })
         </PopoverContent>
       </Popover>
 
-      <Dialog open={createDialogOpen} onOpenChange={setCreateDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Create wiki</DialogTitle>
-          </DialogHeader>
-          <input
-            value={newName}
-            onChange={(e) => setNewName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleCreate()}
-            placeholder="My Research"
-            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-            autoFocus
-          />
-          <DialogFooter>
-            <button
-              onClick={handleCreate}
-              disabled={creating || !newName.trim()}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer"
-            >
-              {creating ? 'Creating...' : 'Create'}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {!isLocal && (
+        <NameDialog
+          open={createDialogOpen}
+          onOpenChange={setCreateDialogOpen}
+          title="Create wiki"
+          value={newName}
+          onValueChange={setNewName}
+          placeholder="My Research"
+          submitLabel="Create"
+          busyLabel="Creating..."
+          busy={creating}
+          onSubmit={handleCreate}
+          onCloseAutoFocus={restoreFocusToTrigger}
+        />
+      )}
 
-      <Dialog open={renameDialogOpen} onOpenChange={setRenameDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Rename wiki</DialogTitle>
-          </DialogHeader>
-          <input
-            value={renameName}
-            onChange={(e) => setRenameName(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleRename()}
-            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-            autoFocus
-          />
-          <DialogFooter>
-            <button
-              onClick={handleRename}
-              disabled={renaming || !renameName.trim() || renameName.trim() === kbName}
-              className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer"
-            >
-              {renaming ? 'Renaming...' : 'Rename'}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <NameDialog
+        open={renameDialogOpen}
+        onOpenChange={setRenameDialogOpen}
+        title="Rename wiki"
+        value={renameName}
+        onValueChange={setRenameName}
+        submitLabel="Rename"
+        busyLabel="Renaming..."
+        busy={renaming}
+        submitDisabled={renameName.trim() === kbName}
+        onSubmit={handleRename}
+        onCloseAutoFocus={restoreFocusToTrigger}
+      />
 
-      <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete wiki</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-muted-foreground">
-            This will permanently delete <strong>{kbName}</strong> and all its documents. This cannot be undone.
-          </p>
-          <DialogFooter>
-            <button
-              onClick={() => setDeleteDialogOpen(false)}
-              className="rounded-lg border border-input px-4 py-2 text-sm font-medium hover:bg-accent cursor-pointer"
-            >
-              Cancel
-            </button>
-            <button
-              onClick={handleDelete}
-              disabled={deleting}
-              className="rounded-lg bg-destructive px-4 py-2 text-sm font-medium text-destructive-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer"
-            >
-              {deleting ? 'Deleting...' : 'Delete'}
-            </button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDialog
+        open={convertDialogOpen}
+        onOpenChange={setConvertDialogOpen}
+        title={isCourse ? 'Convert to wiki' : 'Convert to course'}
+        description={isCourse
+          ? `"${kbName}" returns to a free-form wiki. Lesson progress is kept and restored if you convert back.`
+          : `"${kbName}" presents its pages as ordered lessons with progress tracking and resume. You can convert back at any time.`}
+        confirmLabel="Convert"
+        busyLabel="Converting..."
+        busy={converting}
+        onConfirm={handleConvert}
+        onCloseAutoFocus={restoreFocusToTrigger}
+      />
+
+      {!isLocal && (
+        <ConfirmDialog
+          open={deleteDialogOpen}
+          onOpenChange={setDeleteDialogOpen}
+          title="Delete wiki"
+          description={<>This permanently deletes <strong>{kbName}</strong> and all its sources and wiki pages. This cannot be undone.</>}
+          confirmLabel="Delete"
+          busyLabel="Deleting..."
+          busy={deleting}
+          onConfirm={handleDelete}
+          destructive
+          confirmText={kbName}
+          onCloseAutoFocus={restoreFocusToTrigger}
+        />
+      )}
     </>
   )
 }

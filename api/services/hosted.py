@@ -2,16 +2,61 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
+import json
+import logging
 import re
+import uuid
 from datetime import datetime
+from typing import Any
 
 import asyncpg
-from fastapi import HTTPException
-
 from config import settings
+from domain.file_types import SIMPLE_TEXT_TYPES
+from fastapi import HTTPException
 from services.chunker import chunk_text, store_chunks
-from .base import UserService, KBService, DocumentService, ServiceFactory
-from .types import parse_frontmatter, title_from_filename, extract_tags
+from services.webclip_assets import materialize_webclip_assets
+
+from .base import DocumentService, KBService, PublicWikiService, ServiceFactory, UserService
+from .highlight_merge import merge_highlights_by_id, merge_text_anchors, preserve_replies
+from .parsers import parse_frontmatter, title_from_filename
+from .types import MAX_TEXT_CONTENT_BYTES
+
+logger = logging.getLogger(__name__)
+
+DB_ACQUIRE_TIMEOUT_SECONDS = 10.0
+
+
+async def _acquire_connection(pool):
+    """Bound pool waits so request handlers fail instead of hanging forever."""
+    try:
+        parameters = inspect.signature(pool.acquire).parameters.values()
+        supports_timeout = any(
+            parameter.name == "timeout"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_timeout = False
+
+    if supports_timeout:
+        return await pool.acquire(timeout=DB_ACQUIRE_TIMEOUT_SECONDS)
+    return await asyncio.wait_for(
+        pool.acquire(),
+        timeout=DB_ACQUIRE_TIMEOUT_SECONDS,
+    )
+
+
+def _parse_web_clip(html: str, url: str, highlights: list[dict]):
+    """Run the synchronous HTML parser from a worker thread."""
+    from html_parser import ParseLimitExceededError, Parser
+
+    parser = Parser(html, url=url, content_only=True)
+    try:
+        return parser.parse(highlights=highlights)
+    except ParseLimitExceededError as e:
+        raise HTTPException(status_code=413, detail=str(e)) from e
 
 
 class HostedUserService(UserService):
@@ -54,36 +99,40 @@ class HostedUserService(UserService):
             "total_pages": row["total_pages"],
             "total_storage_bytes": row["total_storage_bytes"],
             "document_count": row["document_count"],
-            "max_pages": limits["page_limit"] if limits else settings.QUOTA_MAX_PAGES,
+            "max_pages": limits["page_limit"] if limits else 0,
             "max_storage_bytes": limits["storage_limit_bytes"] if limits else settings.QUOTA_MAX_STORAGE_BYTES,
         }
 
 
+# Mirrors the web's lesson definition (wikiTree.ts): wiki pages minus the structural hub/log/index.
+_LESSON_FILTER = (
+    "d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%' AND NOT d.archived "
+    "AND (d.path || d.filename) NOT IN ('/wiki/overview.md', '/wiki/log.md', '/wiki/index.json')"
+)
+
 _KB_LIST_QUERY = (
-    "SELECT kb.id, kb.user_id, kb.name, kb.slug, kb.description, "
+    "SELECT kb.id, kb.user_id, kb.name, kb.slug, kb.description, kb.kind, "
     "kb.created_at, kb.updated_at, "
-    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path NOT LIKE '/wiki/%%' AND NOT d.archived) AS source_count, "
-    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%%' AND NOT d.archived) AS wiki_page_count "
+    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path NOT LIKE '/wiki/%' AND NOT d.archived AND COALESCE((d.metadata->>'hidden')::boolean, false) = false) AS source_count, "
+    "(SELECT COUNT(*) FROM documents d WHERE d.knowledge_base_id = kb.id AND d.path LIKE '/wiki/%' AND NOT d.archived) AS wiki_page_count, "
+    f"(SELECT COUNT(*) FROM documents d WHERE {_LESSON_FILTER}) AS lesson_count, "
+    f"(SELECT COUNT(*) FROM documents d WHERE {_LESSON_FILTER} AND d.metadata->'course'->>'status' = 'complete') AS lessons_completed "
     "FROM knowledge_bases kb"
 )
 
 _OVERVIEW_TEMPLATE = """\
+---
+title: Overview
+description: Research hub for {name}.
+date: {date}
+tags: [overview, wiki]
+---
+
 This wiki tracks research on {name}. No sources have been ingested yet.
 
 ## Key Findings
 
-No sources ingested yet — add your first source to get started.
-
-## Recent Updates
-
-No activity yet.\
-"""
-
-_LOG_TEMPLATE = """\
-Chronological record of ingests, queries, and maintenance passes.
-
-## [{date}] created | Wiki Created
-- Initialized wiki: {name}\
+No sources ingested yet — add your first source to get started.\
 """
 
 
@@ -96,9 +145,10 @@ def _slugify(name: str) -> str:
 
 class HostedKBService(KBService):
 
-    def __init__(self, pool, user_id: str):
+    def __init__(self, pool, user_id: str, s3=None):
         self.pool = pool
         self.user_id = user_id
+        self.s3 = s3
 
     async def list(self) -> list[dict]:
         rows = await self.pool.fetch(
@@ -107,35 +157,33 @@ class HostedKBService(KBService):
         )
         return [dict(r) for r in rows]
 
-    async def get(self, kb_id: str) -> dict | None:
-        row = await self.pool.fetchrow(
-            f"{_KB_LIST_QUERY} WHERE kb.id = $1 AND kb.user_id = $2",
-            kb_id, self.user_id,
-        )
-        return dict(row) if row else None
-
-    async def create(self, name: str, description: str | None) -> dict:
+    async def create(self, name: str, description: str | None, kind: str | None = None) -> dict:
         await self._check_capacity()
         slug = await self._unique_slug(name)
-        row = await self._insert_kb(name, slug, description)
+        row = await self._insert_kb(name, slug, description, kind or "wiki")
         await self._scaffold_wiki(row["id"], name)
         return dict(row)
 
-    async def update(self, kb_id: str, name: str | None, description: str | None) -> dict | None:
+    async def update(self, kb_id: str, name: str | None, description: str | None, kind: str | None = None) -> dict | None:
         if name is not None:
-            slug = await self._unique_slug(name)
-            row = await self.pool.fetchrow(
-                "UPDATE knowledge_bases SET name = $1, slug = $2, description = COALESCE($3, description), updated_at = now() "
-                "WHERE id = $4 AND user_id = $5 "
-                "RETURNING id, user_id, name, slug, description, created_at, updated_at",
-                name, slug, description, kb_id, self.user_id,
-            )
+            slug = await self._unique_slug(name, exclude_kb_id=kb_id)
+            try:
+                row = await self.pool.fetchrow(
+                    "UPDATE knowledge_bases SET name = $1, slug = $2, description = COALESCE($3, description), "
+                    "kind = COALESCE($4, kind), updated_at = now() "
+                    "WHERE id = $5 AND user_id = $6 "
+                    "RETURNING id, user_id, name, slug, description, kind, created_at, updated_at",
+                    name, slug, description, kind, kb_id, self.user_id,
+                )
+            except asyncpg.UniqueViolationError as e:
+                raise HTTPException(status_code=409, detail=f"You already have a wiki named '{name}'.") from e
         else:
             row = await self.pool.fetchrow(
-                "UPDATE knowledge_bases SET description = $1, updated_at = now() "
-                "WHERE id = $2 AND user_id = $3 "
-                "RETURNING id, user_id, name, slug, description, created_at, updated_at",
-                description, kb_id, self.user_id,
+                "UPDATE knowledge_bases SET description = COALESCE($1, description), "
+                "kind = COALESCE($2, kind), updated_at = now() "
+                "WHERE id = $3 AND user_id = $4 "
+                "RETURNING id, user_id, name, slug, description, kind, created_at, updated_at",
+                description, kind, kb_id, self.user_id,
             )
         return dict(row) if row else None
 
@@ -144,23 +192,22 @@ class HostedKBService(KBService):
         if user_count and user_count >= settings.GLOBAL_MAX_USERS:
             raise HTTPException(status_code=503, detail="We've reached our user capacity for now. Please try again later.")
 
-    async def _insert_kb(self, name: str, slug: str, description: str | None) -> dict:
-        conn = await self.pool.acquire()
+    async def _insert_kb(self, name: str, slug: str, description: str | None, kind: str = "wiki") -> dict:
+        conn = await _acquire_connection(self.pool)
         try:
-            async with conn.transaction():
-                current_name = name
-                for attempt in range(10):
-                    try:
-                        row = await conn.fetchrow(
-                            "INSERT INTO knowledge_bases (user_id, name, slug, description) "
-                            "VALUES ($1, $2, $3, $4) "
-                            "RETURNING id, user_id, name, slug, description, created_at, updated_at",
-                            self.user_id, current_name, slug, description,
-                        )
-                        return dict(row)
-                    except asyncpg.UniqueViolationError:
-                        current_name = f"{name} ({attempt + 2})"
-                        slug = await self._unique_slug(current_name)
+            current_name = name
+            for attempt in range(10):
+                try:
+                    row = await conn.fetchrow(
+                        "INSERT INTO knowledge_bases (user_id, name, slug, description, kind) "
+                        "VALUES ($1, $2, $3, $4, $5) "
+                        "RETURNING id, user_id, name, slug, description, kind, created_at, updated_at",
+                        self.user_id, current_name, slug, description, kind,
+                    )
+                    return dict(row)
+                except asyncpg.UniqueViolationError:
+                    current_name = f"{name} ({attempt + 2})"
+                    slug = await self._unique_slug(current_name)
         finally:
             await self.pool.release(conn)
         raise HTTPException(status_code=409, detail="Could not create wiki — too many duplicates.")
@@ -169,42 +216,133 @@ class HostedKBService(KBService):
         today = datetime.now().strftime("%Y-%m-%d")
         await self.pool.execute(
             "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-            "file_type, status, content, tags, version, sort_order) "
-            "VALUES ($1, $2, 'overview.md', 'Overview', '/wiki/', 'md', 'ready', $3, $4, 0, -100)",
-            kb_id, self.user_id, _OVERVIEW_TEMPLATE.format(name=name), ["overview"],
-        )
-        await self.pool.execute(
-            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
-            "file_type, status, content, tags, version, sort_order) "
-            "VALUES ($1, $2, 'log.md', 'Log', '/wiki/', 'md', 'ready', $3, $4, 0, 100)",
-            kb_id, self.user_id, _LOG_TEMPLATE.format(name=name, date=today), ["log"],
+            "file_type, status, content, tags, date, metadata, version, sort_order) "
+            "VALUES ($1, $2, 'overview.md', 'Overview', '/wiki/', 'md', 'ready', $3, $4, $5, $6::jsonb, 0, -100)",
+            kb_id,
+            self.user_id,
+            _OVERVIEW_TEMPLATE.format(name=name, date=today),
+            ["overview", "wiki"],
+            today,
+            json.dumps({"description": f"Research hub for {name}."}),
         )
 
+    async def update_sharing(
+        self, kb_id: str, visibility: str, public_slug: str | None,
+    ) -> dict | None:
+        if visibility == "public" and public_slug is None:
+            existing = await self.pool.fetchval(
+                "SELECT public_slug FROM knowledge_bases WHERE id = $1 AND user_id = $2",
+                kb_id, self.user_id,
+            )
+            if existing is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="public_slug is required when publishing a KB for the first time",
+                )
+
+        try:
+            row = await self.pool.fetchrow(
+                "UPDATE knowledge_bases "
+                "SET visibility = $1::kb_visibility, "
+                "    public_slug = CASE WHEN $1 = 'public' THEN COALESCE($2, public_slug) ELSE public_slug END, "
+                "    visibility_updated_at = now(), "
+                "    published_at = CASE WHEN $1 = 'public' AND published_at IS NULL THEN now() ELSE published_at END, "
+                "    updated_at = now() "
+                "WHERE id = $3 AND user_id = $4 "
+                "RETURNING id, user_id, name, slug, description, "
+                "          visibility::text AS visibility, public_slug, share_token, "
+                "          visibility_updated_at, published_at, created_at, updated_at",
+                visibility, public_slug, kb_id, self.user_id,
+            )
+        except asyncpg.UniqueViolationError as e:
+            if e.constraint_name == "idx_knowledge_bases_public_slug":
+                raise HTTPException(status_code=409, detail="That public slug is already taken — try another.") from e
+            raise
+        except asyncpg.CheckViolationError as e:
+            if e.constraint_name == "knowledge_bases_public_slug_format":
+                raise HTTPException(status_code=400, detail="Slug must be 2–80 lowercase characters, digits, or hyphens (no leading/trailing hyphen).") from e
+            raise
+        return dict(row) if row else None
+
     async def delete(self, kb_id: str) -> bool:
+        doc_ids = await self._kb_document_ids(kb_id)
         result = await self.pool.execute(
             "DELETE FROM knowledge_bases WHERE id = $1 AND user_id = $2",
             kb_id, self.user_id,
         )
-        return result != "DELETE 0"
+        if result == "DELETE 0":
+            return False
+        await self._purge_document_prefixes(doc_ids)
+        return True
 
-    async def _unique_slug(self, name: str) -> str:
+    async def _kb_document_ids(self, kb_id: str) -> list[str]:
+        rows = await self.pool.fetch(
+            "SELECT id::text FROM documents WHERE knowledge_base_id = $1 AND user_id = $2",
+            kb_id, self.user_id,
+        )
+        return [row["id"] for row in rows]
+
+    async def _purge_document_prefixes(self, doc_ids: list[str]) -> None:
+        if not self.s3:
+            return
+        for doc_id in doc_ids:
+            try:
+                await self.s3.delete_prefix(f"{self.user_id}/{doc_id}/")
+            except Exception:
+                logger.exception("S3 purge failed for document %s", doc_id)
+
+    async def _unique_slug(self, name: str, exclude_kb_id: str | None = None) -> str:
         base = _slugify(name)
         slug = base
         counter = 2
         while await self.pool.fetchval(
-            "SELECT 1 FROM knowledge_bases WHERE slug = $1 AND user_id = $2",
-            slug, self.user_id,
+            "SELECT 1 FROM knowledge_bases WHERE slug = $1 AND user_id = $2 AND id IS DISTINCT FROM $3::uuid",
+            slug, self.user_id, exclude_kb_id,
         ):
             slug = f"{base}-{counter}"
             counter += 1
         return slug
 
 
+_UPDATABLE_DOCUMENT_COLUMNS = (
+    "filename", "path", "title", "date", "knowledge_base_id", "document_number", "tags",
+)
+
 _DOC_COLUMNS = (
     "id, knowledge_base_id, user_id, filename, path, title, "
     "file_type, status, tags, date, metadata, error_message, "
     "version, document_number, archived, created_at, updated_at"
 )
+
+
+def _doc_dict(row) -> dict:
+    """asyncpg returns jsonb as str — decode metadata so responses carry an object."""
+    doc = dict(row)
+    if isinstance(doc.get("metadata"), str):
+        doc["metadata"] = json.loads(doc["metadata"])
+    return doc
+
+_WEBCLIP_ROOT = "/webclipper/"
+
+
+def _normalize_webclip_path(path: str | None) -> str:
+    missing = path is None or not path.strip()
+    raw = _WEBCLIP_ROOT if missing else path.strip()
+    if "\\" in raw or "\x00" in raw:
+        raise HTTPException(status_code=400, detail="Invalid folder path")
+    raw = "/" + raw.strip("/") + "/"
+    raw = re.sub(r"/+", "/", raw)
+    parts = [p for p in raw.split("/") if p]
+    if not parts and not missing:
+        raise HTTPException(status_code=400, detail="Web clips must be stored under /webclipper/")
+    if any(p in {".", ".."} for p in parts):
+        raise HTTPException(status_code=400, detail="Invalid folder path")
+    normalized = "/" + "/".join(parts) + "/" if parts else _WEBCLIP_ROOT
+    if normalized != _WEBCLIP_ROOT and not normalized.startswith(_WEBCLIP_ROOT):
+        raise HTTPException(status_code=400, detail="Web clips must be stored under /webclipper/")
+    return normalized
+
+
 
 
 class HostedDocumentService(DocumentService):
@@ -218,23 +356,29 @@ class HostedDocumentService(DocumentService):
         if path:
             rows = await self.pool.fetch(
                 f"SELECT {_DOC_COLUMNS} FROM documents "
-                "WHERE knowledge_base_id = $1 AND archived = false AND path = $2 AND user_id = $3 ORDER BY filename",
+                "WHERE knowledge_base_id = $1 AND archived = false AND path = $2 AND user_id = $3 "
+                "AND COALESCE(metadata->>'hidden', 'false') <> 'true' "
+                "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+                "ORDER BY filename",
                 kb_id, path, self.user_id,
             )
         else:
             rows = await self.pool.fetch(
                 f"SELECT {_DOC_COLUMNS} FROM documents "
-                "WHERE knowledge_base_id = $1 AND archived = false AND user_id = $2 ORDER BY filename",
+                "WHERE knowledge_base_id = $1 AND archived = false AND user_id = $2 "
+                "AND COALESCE(metadata->>'hidden', 'false') <> 'true' "
+                "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+                "ORDER BY filename",
                 kb_id, self.user_id,
             )
-        return [dict(r) for r in rows]
+        return [_doc_dict(r) for r in rows]
 
     async def get(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(
             f"SELECT {_DOC_COLUMNS} FROM documents WHERE id = $1 AND user_id = $2",
             doc_id, self.user_id,
         )
-        return dict(row) if row else None
+        return _doc_dict(row) if row else None
 
     async def get_content(self, doc_id: str) -> dict | None:
         row = await self.pool.fetchrow(
@@ -264,14 +408,13 @@ class HostedDocumentService(DocumentService):
         return {"url": url}
 
     async def create_note(self, kb_id: str, filename: str, path: str, content: str) -> dict:
-        kb = await self.pool.fetchval(
-            "SELECT id FROM knowledge_bases WHERE id = $1 AND user_id = $2",
-            kb_id, self.user_id,
-        )
-        if not kb:
-            raise HTTPException(status_code=404, detail="Knowledge base not found")
+        content_size = len(content.encode("utf-8"))
+        if content_size > MAX_TEXT_CONTENT_BYTES:
+            raise HTTPException(status_code=413, detail="Text content exceeds the 10 MiB limit")
 
-        meta = parse_frontmatter(content)
+        await self._validate_kb(kb_id)
+
+        meta = await asyncio.to_thread(parse_frontmatter, content)
         title = meta.get("title", "").strip() or title_from_filename(filename)
         tags = [str(t) for t in meta.get("tags", []) if t is not None] if isinstance(meta.get("tags"), list) else []
 
@@ -283,77 +426,529 @@ class HostedDocumentService(DocumentService):
         if existing:
             raise HTTPException(status_code=409, detail=f"'{filename}' already exists at {path}")
 
-        conn = await self.pool.acquire()
+        chunks = await asyncio.to_thread(chunk_text, content) if content else []
+
+        conn = await _acquire_connection(self.pool)
         try:
             async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1::text))",
+                    self.user_id,
+                )
+                await self._check_storage_available(content_size, conn=conn)
                 row = await conn.fetchrow(
                     f"INSERT INTO documents (knowledge_base_id, user_id, filename, path, title, "
-                    f"file_type, status, content, tags) "
-                    f"VALUES ($1, $2, $3, $4, $5, 'md', 'ready', $6, $7) "
+                    f"file_type, file_size, status, content, tags) "
+                    f"VALUES ($1, $2, $3, $4, $5, 'md', $6, 'ready', $7, $8) "
                     f"RETURNING {_DOC_COLUMNS}",
-                    kb_id, self.user_id, filename, path, title, content, tags,
+                    kb_id, self.user_id, filename, path, title, content_size, content, tags,
                 )
-                if content:
-                    chunks = chunk_text(content)
+                if chunks:
                     await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
         finally:
             await self.pool.release(conn)
-        return dict(row)
+        return _doc_dict(row)
 
-    async def update_content(self, doc_id: str, content: str) -> dict | None:
+    async def create_web_clip(
+        self, kb_id: str, url: str, title: str, html: str,
+        highlights: list[dict] | None = None, path: str = "/webclipper/",
+    ) -> dict:
+        await self._validate_kb(kb_id)
+        path = _normalize_webclip_path(path)
+
+        result = await asyncio.to_thread(
+            _parse_web_clip,
+            html,
+            url,
+            highlights or [],
+        )
+
+        existing_preview = await self.pool.fetchrow(
+            "SELECT id::text, filename FROM documents "
+            "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
+            "AND metadata->>'source_url' = $3 "
+            "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            kb_id, self.user_id, url,
+        )
+
+        if existing_preview:
+            filename = existing_preview["filename"]
+        else:
+            filename = self._slugify_filename(title, "md")
+            filename = await self._dedupe_filename(kb_id, path, filename, "md")
+        stem = filename.rsplit(".", 1)[0]
+        markdown, assets = await materialize_webclip_assets(
+            result.content,
+            result.images,
+            f"{stem}.assets",
+        )
+        markdown_size = len((markdown or "").encode("utf-8"))
+        file_size = markdown_size + sum(len(asset.data) for asset in assets)
+        chunks = await asyncio.to_thread(chunk_text, markdown) if markdown else []
+        # Fast-fail only; the in-transaction check under the advisory lock is authoritative.
+        await self._check_storage_available(file_size)
+
+        enriched = merge_text_anchors(highlights or [], result.highlights)
+        parent_doc_id = str(existing_preview["id"]) if existing_preview else str(uuid.uuid4())
+        for asset in assets:
+            asset.document_id = str(uuid.uuid4())
+
+        parent_metadata = {
+            "source_url": url,
+            "clip_kind": "web",
+            "assets": [asset.metadata() for asset in assets],
+        }
+
+        if self.s3:
+            for asset in assets:
+                await self.s3.upload_bytes(
+                    f"{self.user_id}/{asset.document_id}/source.{asset.file_type}",
+                    asset.data,
+                    asset.content_type,
+                )
+
+        old_asset_ids: list[str] = []
+        conn = await _acquire_connection(self.pool)
+        try:
+            async with conn.transaction():
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1))", self.user_id)
+                await self._check_storage_available(file_size, conn=conn)
+                existing = None
+                if existing_preview:
+                    existing = await conn.fetchrow(
+                        "SELECT id::text, version, highlights FROM documents "
+                        "WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                        parent_doc_id, self.user_id,
+                    )
+                if not existing:
+                    existing = await conn.fetchrow(
+                        "SELECT id::text, version, highlights FROM documents "
+                        "WHERE knowledge_base_id = $1 AND user_id = $2 AND NOT archived "
+                        "AND metadata->>'source_url' = $3 "
+                        "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+                        "ORDER BY updated_at DESC LIMIT 1 FOR UPDATE",
+                        kb_id, self.user_id, url,
+                    )
+
+                if existing:
+                    parent_doc_id = str(existing["id"])
+                    current_highlights = self._parse_highlights(existing["highlights"])
+                    next_highlights = merge_highlights_by_id(current_highlights, enriched)
+                    row = await conn.fetchrow(
+                        f"UPDATE documents SET path = $1, title = $2, file_size = $3, "
+                        f"status = 'ready', content = $4, metadata = COALESCE(metadata, '{{}}'::jsonb) || $5::jsonb, "
+                        f"highlights = $6::jsonb, version = version + 1, updated_at = now() "
+                        f"WHERE id = $7 AND user_id = $8 "
+                        f"RETURNING {_DOC_COLUMNS}",
+                        path, title, markdown_size, markdown, json.dumps(parent_metadata),
+                        json.dumps(next_highlights), parent_doc_id, self.user_id,
+                    )
+                    # Re-clip: clear old asset docs so fresh ones don't collide on (kb, path, filename).
+                    old_asset_ids = [
+                        r["id"] for r in await conn.fetch(
+                            "SELECT id::text FROM documents WHERE user_id = $1 "
+                            "AND metadata->>'parent_document_id' = $2",
+                            self.user_id, parent_doc_id,
+                        )
+                    ]
+                    if old_asset_ids:
+                        await conn.execute(
+                            "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
+                            old_asset_ids, self.user_id,
+                        )
+                else:
+                    next_highlights = enriched
+                    row = await conn.fetchrow(
+                        f"INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                        f"file_type, file_size, status, content, tags, metadata, highlights) "
+                        f"VALUES ($1, $2, $3, $4, $5, $6, 'md', $7, 'ready', $8, $9, $10, $11::jsonb) "
+                        f"RETURNING {_DOC_COLUMNS}",
+                        parent_doc_id, kb_id, self.user_id, filename, path, title, markdown_size, markdown,
+                        [], json.dumps(parent_metadata), json.dumps(next_highlights),
+                    )
+                for asset in assets:
+                    await conn.execute(
+                        "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                        "file_type, file_size, status, content, tags, metadata) "
+                        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', NULL, $9, $10::jsonb)",
+                        asset.document_id,
+                        kb_id,
+                        self.user_id,
+                        asset.filename,
+                        f"{path}{stem}.assets/",
+                        asset.filename,
+                        asset.file_type,
+                        len(asset.data),
+                        [],
+                        json.dumps({
+                            "asset": True,
+                            "hidden": True,
+                            "parent_document_id": parent_doc_id,
+                            "source_url": url,
+                            **asset.metadata(),
+                        }),
+                    )
+                if chunks:
+                    await store_chunks(conn, str(row["id"]), self.user_id, str(kb_id), chunks)
+                else:
+                    await conn.execute("DELETE FROM document_chunks WHERE document_id = $1", str(row["id"]))
+                # Chunks were just replaced; re-materialize highlights or their comments stay unsearchable.
+                if next_highlights:
+                    await self._recompute_chunks_for_doc(
+                        conn, str(row["id"]), [], next_highlights,
+                    )
+        finally:
+            await self.pool.release(conn)
+
+        await self._purge_s3(old_asset_ids)
+
+        response = _doc_dict(row)
+        response["highlights"] = next_highlights
+        return response
+
+    async def get_by_source_url(self, url: str) -> dict | None:
         row = await self.pool.fetchrow(
-            "UPDATE documents SET content = $1, version = version + 1, updated_at = now() "
-            "WHERE id = $2 AND user_id = $3 RETURNING id, content, version",
-            content, doc_id, self.user_id,
+            "SELECT id::text, knowledge_base_id::text, title, path, filename, "
+            "version, highlights "
+            "FROM documents "
+            "WHERE user_id = $1 AND NOT archived "
+            "AND metadata->>'source_url' = $2 "
+            "AND COALESCE(metadata->>'asset', 'false') <> 'true' "
+            "ORDER BY updated_at DESC LIMIT 1",
+            self.user_id, url,
         )
         if not row:
             return None
+        result = dict(row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
 
-        kb_id = await self.pool.fetchval(
-            "SELECT knowledge_base_id::text FROM documents WHERE id = $1 AND user_id = $2",
+    async def get_highlights(self, doc_id: str) -> dict | None:
+        row = await self.pool.fetchrow(
+            "SELECT id::text, version, highlights FROM documents "
+            "WHERE id = $1 AND user_id = $2",
             doc_id, self.user_id,
         )
-        if kb_id:
-            chunks = chunk_text(content) if content else []
-            await store_chunks(self.pool, str(doc_id), self.user_id, kb_id, chunks)
+        if not row:
+            return None
+        result = dict(row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    @staticmethod
+    def _parse_highlights(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
+    async def upsert_highlight(
+        self, doc_id: str, highlight: dict,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        """Upsert one highlight by `id`, atomically and idempotently."""
+        new_id = highlight.get("id")
+        if not new_id:
+            return None
+
+        conn = await _acquire_connection(self.pool)
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT version, highlights FROM documents "
+                    "WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                    doc_id, self.user_id,
+                )
+                if not row:
+                    return None
+                if expected_version is not None and row["version"] != expected_version:
+                    return {"conflict": True}
+
+                current = self._parse_highlights(row["highlights"])
+                preserve_replies([highlight], current)
+                replaced = False
+                next_list: list[dict] = []
+                for h in current:
+                    if isinstance(h, dict) and h.get("id") == new_id:
+                        next_list.append(highlight)
+                        replaced = True
+                    else:
+                        next_list.append(h)
+                if not replaced:
+                    if len(current) >= 500:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Highlight limit reached (500 per document)",
+                        )
+                    next_list.append(highlight)
+
+                updated = await conn.fetchrow(
+                    "UPDATE documents SET highlights = $1::jsonb, "
+                    "version = version + 1, updated_at = now() "
+                    "WHERE id = $2 AND user_id = $3 "
+                    "RETURNING id::text, version, highlights",
+                    json.dumps(next_list), doc_id, self.user_id,
+                )
+                if updated:
+                    await self._recompute_chunks_for_doc(
+                        conn, doc_id, current, next_list,
+                    )
+        finally:
+            await self.pool.release(conn)
+
+        if not updated:
+            return None
+        result = dict(updated)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    async def delete_highlight(
+        self, doc_id: str, highlight_id: str,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        """Delete one highlight by `id`; an absent id is a no-op that leaves the version unchanged."""
+        conn = await _acquire_connection(self.pool)
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT version, highlights FROM documents "
+                    "WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                    doc_id, self.user_id,
+                )
+                if not row:
+                    return None
+                if expected_version is not None and row["version"] != expected_version:
+                    return {"conflict": True}
+
+                current = self._parse_highlights(row["highlights"])
+                next_list = [
+                    h for h in current
+                    if not (isinstance(h, dict) and h.get("id") == highlight_id)
+                ]
+                if len(next_list) == len(current):
+                    return {
+                        "id": doc_id,
+                        "version": row["version"],
+                        "highlights": current,
+                    }
+
+                updated = await conn.fetchrow(
+                    "UPDATE documents SET highlights = $1::jsonb, "
+                    "version = version + 1, updated_at = now() "
+                    "WHERE id = $2 AND user_id = $3 "
+                    "RETURNING id::text, version, highlights",
+                    json.dumps(next_list), doc_id, self.user_id,
+                )
+                if updated:
+                    await self._recompute_chunks_for_doc(
+                        conn, doc_id, current, next_list,
+                    )
+        finally:
+            await self.pool.release(conn)
+
+        if not updated:
+            return None
+        result = dict(updated)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    async def _recompute_chunks_for_doc(
+        self, conn, doc_id: str,
+        old_highlights: list[dict], new_highlights: list[dict],
+    ) -> None:
+        """Rewrite annotations on chunks touched by old ∪ new highlights, inside the caller's transaction."""
+        from services.chunk_text_index import ChunkTextIndex
+        from services.highlight_chunks import all_affected_chunks, iter_chunks_with_annotations
+        from services.types import ChunkRecord
+
+        rows = await conn.fetch(
+            "SELECT id::text AS id, chunk_index, source_content, page, start_char "
+            "FROM document_chunks WHERE document_id = $1 "
+            "ORDER BY chunk_index",
+            doc_id,
+        )
+        if not rows:
+            return
+        chunks = [
+            ChunkRecord(
+                id=r["id"], chunk_index=r["chunk_index"],
+                source_content=r["source_content"] or "",
+                page=r["page"], start_char=r["start_char"],
+            )
+            for r in rows
+        ]
+        index = ChunkTextIndex(chunks)
+        affected = all_affected_chunks(index, old_highlights, new_highlights)
+        if not affected:
+            return
+
+        updates = list(iter_chunks_with_annotations(index, affected, new_highlights))
+        await conn.execute(
+            "UPDATE document_chunks c "
+            "SET annotations_text = u.annotations_text, has_highlight = u.has_highlight, content = u.content "
+            "FROM UNNEST($1::uuid[], $2::text[], $3::bool[], $4::text[]) "
+            "AS u(id, annotations_text, has_highlight, content) "
+            "WHERE c.id = u.id",
+            [chunk.id for chunk, _, _, _ in updates],
+            [anno_text for _, anno_text, _, _ in updates],
+            [has_hl for _, _, has_hl, _ in updates],
+            [new_content for _, _, _, new_content in updates],
+        )
+
+    @staticmethod
+    def _reraise_doc_conflict(e: asyncpg.UniqueViolationError):
+        """Map a (kb, path, filename) collision to a 409; re-raise anything else."""
+        if e.constraint_name == "idx_documents_unique_active":
+            raise HTTPException(status_code=409, detail="A document already exists at that path.")
+        raise e
+
+    async def _validate_kb(self, kb_id: str) -> None:
+        kb = await self.pool.fetchval(
+            "SELECT id FROM knowledge_bases WHERE id = $1 AND user_id = $2",
+            kb_id, self.user_id,
+        )
+        if not kb:
+            raise HTTPException(status_code=404, detail="Knowledge base not found")
+
+    @staticmethod
+    def _slugify_filename(title: str, ext: str) -> str:
+        slug = re.sub(r"[^\w\s\-.]", "", title.lower().replace(" ", "-"))[:80].strip("-._")
+        slug = slug or "web-clip"
+        return f"{slug}.{ext}"
+
+    async def _dedupe_filename(self, kb_id: str, path: str, filename: str, ext: str) -> str:
+        exists = await self.pool.fetchval(
+            "SELECT id FROM documents WHERE knowledge_base_id = $1 AND user_id = $2 "
+            "AND filename = $3 AND path = $4 AND NOT archived",
+            kb_id, self.user_id, filename, path,
+        )
+        if not exists:
+            return filename
+        base = filename.rsplit(".", 1)[0]
+        for i in range(2, 100):
+            candidate = f"{base}-{i}.{ext}"
+            dup = await self.pool.fetchval(
+                "SELECT id FROM documents WHERE knowledge_base_id = $1 AND user_id = $2 "
+                "AND filename = $3 AND path = $4 AND NOT archived",
+                kb_id, self.user_id, candidate, path,
+            )
+            if not dup:
+                return candidate
+        return filename
+
+    async def _check_storage_available(self, new_bytes: int, conn: Any | None = None) -> None:
+        query = (
+            "SELECT COALESCE(SUM(file_size), 0) FROM documents "
+            "WHERE user_id = $1"
+        )
+        limit_query = "SELECT storage_limit_bytes FROM users WHERE id = $1"
+        db = conn or self.pool
+        limits = await db.fetchrow(limit_query, self.user_id)
+        storage_limit = (
+            limits["storage_limit_bytes"]
+            if limits else settings.QUOTA_MAX_STORAGE_BYTES
+        )
+        current_bytes = await db.fetchval(query, self.user_id)
+        current_bytes = current_bytes or 0
+        if current_bytes + new_bytes > storage_limit:
+            used_mb = current_bytes / (1024 * 1024)
+            max_mb = storage_limit / (1024 * 1024)
+            raise HTTPException(
+                status_code=413,
+                detail=f"Storage quota exceeded. Using {used_mb:.0f} MB of {max_mb:.0f} MB.",
+            )
+
+    async def update_content(self, doc_id: str, content: str) -> dict | None:
+        content_size = len(content.encode("utf-8"))
+        if content_size > MAX_TEXT_CONTENT_BYTES:
+            raise HTTPException(status_code=413, detail="Text content exceeds the 10 MiB limit")
+
+        chunks = await asyncio.to_thread(chunk_text, content) if content else []
+
+        conn = await _acquire_connection(self.pool)
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1::text))",
+                    self.user_id,
+                )
+                current = await conn.fetchrow(
+                    "SELECT file_size, file_type, highlights, knowledge_base_id::text AS kb_id "
+                    "FROM documents WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                    doc_id, self.user_id,
+                )
+                if not current:
+                    return None
+
+                # Extracted text of a binary source isn't the stored file; its size stays the blob's.
+                stored_size = current["file_size"] or 0
+                new_size = content_size if current["file_type"] in SIMPLE_TEXT_TYPES else stored_size
+                await self._check_storage_available(new_size - stored_size, conn=conn)
+                row = await conn.fetchrow(
+                    "UPDATE documents SET content = $1, file_size = $2, "
+                    "version = version + 1, updated_at = now(), stale_since = NULL "
+                    "WHERE id = $3 AND user_id = $4 RETURNING id, content, version",
+                    content, new_size, doc_id, self.user_id,
+                )
+
+                await store_chunks(
+                    conn, str(doc_id), self.user_id, current["kb_id"], chunks,
+                )
+                await self._recompute_chunks_for_doc(
+                    conn, doc_id, [], self._parse_highlights(current["highlights"]),
+                )
+        finally:
+            await self.pool.release(conn)
 
         return dict(row)
 
     async def update_metadata(self, doc_id: str, fields: dict) -> dict | None:
-        import json as _json
-        sets = []
-        params = []
-        idx = 1
-        for key in ("filename", "path", "title", "date"):
-            if key in fields:
-                sets.append(f"{key} = ${idx}")
-                params.append(fields[key])
-                idx += 1
-        if "tags" in fields:
-            sets.append(f"tags = ${idx}")
-            params.append(fields["tags"])
-            idx += 1
-        if "metadata" in fields:
-            sets.append(f"metadata = ${idx}")
-            params.append(_json.dumps(fields["metadata"]))
-            idx += 1
+        if "knowledge_base_id" in fields:
+            return await self._move_document(doc_id, fields)
+        try:
+            row = await self._update_document_fields(self.pool, doc_id, fields)
+        except asyncpg.UniqueViolationError as e:
+            self._reraise_doc_conflict(e)
+        return _doc_dict(row) if row else None
 
-        if not sets:
-            return None
+    async def _move_document(self, doc_id: str, fields: dict) -> dict | None:
+        """Move a document into another owned KB, applying its other metadata changes atomically."""
+        new_kb_id = fields["knowledge_base_id"]
+        conn = await _acquire_connection(self.pool)
+        try:
+            async with conn.transaction():
+                await self._lock_owned_target_kb(conn, new_kb_id)
+                # document_number is unique per KB and assigned only on INSERT, so a move must assign a fresh one.
+                next_number = await self._next_document_number(conn, new_kb_id)
+                try:
+                    row = await self._update_document_fields(
+                        conn, doc_id, {**fields, "document_number": next_number},
+                    )
+                except asyncpg.UniqueViolationError as e:
+                    self._reraise_doc_conflict(e)
+                if not row:
+                    return None
+                await self._repoint_chunks_to_kb(conn, doc_id, new_kb_id)
+                # References are KB-scoped; the next graph rebuild re-derives them in the new KB.
+                await self._delete_document_references(conn, doc_id)
+        finally:
+            await self.pool.release(conn)
+        return _doc_dict(row)
 
-        sets.append("updated_at = now()")
-        params.extend([doc_id, self.user_id])
-        sql = (
-            f"UPDATE documents SET {', '.join(sets)} "
-            f"WHERE id = ${idx} AND user_id = ${idx + 1} "
-            f"RETURNING {_DOC_COLUMNS}"
-        )
-        row = await self.pool.fetchrow(sql, *params)
-        return dict(row) if row else None
+    async def _lock_owned_target_kb(self, conn: asyncpg.Connection, kb_id: str) -> None:
+        """Pin ownership of the target KB and serialize moves into it until commit."""
+        if not await self._select_owned_kb_for_share(conn, kb_id):
+            raise HTTPException(status_code=404, detail="Target knowledge base not found")
+        await self._advisory_xact_lock(conn, kb_id)
 
     async def delete(self, doc_id: str) -> bool:
-        # Wiki pages are archived to preserve slugs and cross-references;
-        # source documents are hard-deleted so the filename can be re-used.
+        # Wiki pages archive to keep slugs/links intact; sources hard-delete so the filename is reusable.
         row = await self.pool.fetchrow(
             "SELECT path FROM documents WHERE id = $1 AND user_id = $2",
             doc_id, self.user_id,
@@ -366,14 +961,7 @@ class HostedDocumentService(DocumentService):
                 doc_id, self.user_id,
             )
             return result != "UPDATE 0"
-        await self.pool.execute("DELETE FROM document_pages WHERE document_id = $1", doc_id)
-        await self.pool.execute("DELETE FROM document_chunks WHERE document_id = $1", doc_id)
-        await self.pool.execute("DELETE FROM document_references WHERE source_document_id = $1 OR target_document_id = $1", doc_id)
-        result = await self.pool.execute(
-            "DELETE FROM documents WHERE id = $1 AND user_id = $2",
-            doc_id, self.user_id,
-        )
-        return result != "DELETE 0"
+        return await self._hard_delete([doc_id]) > 0
 
     async def bulk_delete(self, doc_ids: list[str]) -> int:
         if not doc_ids:
@@ -391,16 +979,182 @@ class HostedDocumentService(DocumentService):
                 wiki_ids, self.user_id,
             )
             count += int(result.split()[-1]) if result else 0
-        if source_ids:
-            await self.pool.execute("DELETE FROM document_pages WHERE document_id = ANY($1::uuid[])", source_ids)
-            await self.pool.execute("DELETE FROM document_chunks WHERE document_id = ANY($1::uuid[])", source_ids)
-            await self.pool.execute("DELETE FROM document_references WHERE source_document_id = ANY($1::uuid[]) OR target_document_id = ANY($1::uuid[])", source_ids)
-            result = await self.pool.execute(
-                "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
-                source_ids, self.user_id,
-            )
-            count += int(result.split()[-1]) if result else 0
+        count += await self._hard_delete(source_ids)
         return count
+
+    async def _hard_delete(self, source_ids: list[str]) -> int:
+        if not source_ids:
+            return 0
+        doc_ids = source_ids + await self._child_asset_ids(source_ids)
+        result = await self.pool.execute(
+            "DELETE FROM documents WHERE id = ANY($1::uuid[]) AND user_id = $2",
+            doc_ids, self.user_id,
+        )
+        deleted = int(result.split()[-1]) if result else 0
+        if deleted:
+            await self._purge_s3(doc_ids)
+        return deleted
+
+    async def _child_asset_ids(self, parent_ids: list[str]) -> list[str]:
+        rows = await self.pool.fetch(
+            "SELECT id::text FROM documents WHERE user_id = $1 "
+            "AND metadata->>'parent_document_id' = ANY($2::text[])",
+            self.user_id, parent_ids,
+        )
+        return [r["id"] for r in rows]
+
+    async def _purge_s3(self, doc_ids: list[str]) -> None:
+        if not self.s3:
+            return
+        for doc_id in doc_ids:
+            try:
+                await self.s3.delete_prefix(f"{self.user_id}/{doc_id}/")
+            except Exception:
+                logger.exception("S3 purge failed for document %s", doc_id)
+
+    async def _update_document_fields(
+        self, executor: asyncpg.Pool | asyncpg.Connection, doc_id: str, fields: dict,
+    ) -> asyncpg.Record | None:
+        sets: list[str] = []
+        params: list = []
+        for column in _UPDATABLE_DOCUMENT_COLUMNS:
+            if column in fields:
+                params.append(fields[column])
+                sets.append(f"{column} = ${len(params)}")
+        if "metadata" in fields:
+            params.append(json.dumps(fields["metadata"]))
+            sets.append(f"metadata = COALESCE(metadata, '{{}}'::jsonb) || ${len(params)}::jsonb")
+        if not sets:
+            return None
+        params.extend([doc_id, self.user_id])
+        return await executor.fetchrow(
+            f"UPDATE documents SET {', '.join(sets)}, updated_at = now() "
+            f"WHERE id = ${len(params) - 1} AND user_id = ${len(params)} "
+            f"RETURNING {_DOC_COLUMNS}",
+            *params,
+        )
+
+    async def _select_owned_kb_for_share(self, conn: asyncpg.Connection, kb_id: str) -> int | None:
+        # FOR SHARE so a concurrent transfer can't flip target-KB ownership before we commit.
+        return await conn.fetchval(
+            "SELECT 1 FROM knowledge_bases WHERE id = $1 AND user_id = $2 FOR SHARE",
+            kb_id, self.user_id,
+        )
+
+    @staticmethod
+    async def _advisory_xact_lock(conn: asyncpg.Connection, key: str) -> None:
+        await conn.execute("SELECT pg_advisory_xact_lock(hashtext($1::text))", key)
+
+    @staticmethod
+    async def _next_document_number(conn: asyncpg.Connection, kb_id: str) -> int:
+        return await conn.fetchval(
+            "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents WHERE knowledge_base_id = $1",
+            kb_id,
+        )
+
+    @staticmethod
+    async def _repoint_chunks_to_kb(conn: asyncpg.Connection, doc_id: str, kb_id: str) -> None:
+        await conn.execute(
+            "UPDATE document_chunks SET knowledge_base_id = $1 WHERE document_id = $2",
+            kb_id, doc_id,
+        )
+
+    @staticmethod
+    async def _delete_document_references(conn: asyncpg.Connection, doc_id: str) -> None:
+        await conn.execute(
+            "DELETE FROM document_references WHERE source_document_id = $1 OR target_document_id = $1",
+            doc_id,
+        )
+
+
+class HostedPublicWikiService(PublicWikiService):
+    """Anonymous read-only access to wikis with visibility = 'public'."""
+
+    def __init__(self, pool, s3=None):
+        self.pool = pool
+        self.s3 = s3
+
+    async def get_by_slug(self, slug: str) -> dict | None:
+        # One statement reads one snapshot: no TOCTOU between the visibility check and the content.
+        rows = await self.pool.fetch(
+            "SELECT kb.id::text AS kb_id, kb.user_id::text AS kb_user_id, "
+            "       kb.name AS kb_name, kb.description AS kb_description, "
+            "       kb.public_slug AS kb_public_slug, "
+            "       kb.published_at AS kb_published_at, "
+            "       kb.updated_at AS kb_updated_at, "
+            "       u.display_name AS author_name, "
+            "       d.id::text AS doc_id, d.document_number, d.filename, "
+            "       d.path, d.title, d.content, d.file_type, d.tags, "
+            "       d.updated_at AS doc_updated_at "
+            "FROM knowledge_bases kb "
+            "LEFT JOIN users u ON u.id = kb.user_id "
+            "LEFT JOIN documents d ON d.knowledge_base_id = kb.id "
+            "  AND d.path LIKE '/wiki/%' "
+            "  AND d.status = 'ready' "
+            "  AND NOT d.archived "
+            "WHERE kb.public_slug = $1 AND kb.visibility = 'public' "
+            "ORDER BY d.path, COALESCE(d.sort_order, 0), d.filename",
+            slug,
+        )
+        if not rows:
+            return None
+
+        head = rows[0]
+        documents = [
+            {
+                "id": r["doc_id"],
+                "document_number": r["document_number"],
+                "filename": r["filename"],
+                "path": r["path"],
+                "title": r["title"],
+                "content": r["content"],
+                "file_type": r["file_type"],
+                "tags": r["tags"],
+                "updated_at": r["doc_updated_at"],
+            }
+            for r in rows if r["doc_id"] is not None
+        ]
+
+        return {
+            "kb": {
+                "id": head["kb_id"],
+                "name": head["kb_name"],
+                "description": head["kb_description"],
+                "public_slug": head["kb_public_slug"],
+                "published_at": head["kb_published_at"].isoformat() if head["kb_published_at"] else None,
+                "updated_at": head["kb_updated_at"].isoformat() if head["kb_updated_at"] else None,
+                "author_name": head["author_name"] or None,
+            },
+            "documents": documents,
+        }
+
+    async def get_asset_key(self, slug: str, document_number: int) -> str | None:
+        row = await self.pool.fetchrow(
+            "SELECT d.id::text AS doc_id, d.user_id::text AS user_id, "
+            "       d.filename, d.file_type "
+            "FROM documents d "
+            "JOIN knowledge_bases kb ON kb.id = d.knowledge_base_id "
+            "WHERE kb.public_slug = $1 "
+            "  AND kb.visibility = 'public' "
+            "  AND d.document_number = $2 "
+            "  AND d.path LIKE '/wiki/%' "
+            "  AND d.status = 'ready' "
+            "  AND NOT d.archived",
+            slug, document_number,
+        )
+        if not row:
+            return None
+
+        ext = (
+            row["filename"].rsplit(".", 1)[-1].lower()
+            if "." in row["filename"]
+            else row["file_type"]
+        )
+        if ext in {"pptx", "ppt", "docx", "doc"}:
+            return f"{row['user_id']}/{row['doc_id']}/converted.pdf"
+        if ext in {"html", "htm"}:
+            return f"{row['user_id']}/{row['doc_id']}/tagged.html"
+        return f"{row['user_id']}/{row['doc_id']}/source.{ext}"
 
 
 class HostedServiceFactory(ServiceFactory):
@@ -413,8 +1167,11 @@ class HostedServiceFactory(ServiceFactory):
     def user_service(self, user_id: str) -> HostedUserService:
         return HostedUserService(self.pool, user_id)
 
-    def kb_service(self, user_id: str) -> "HostedKBService":
-        return HostedKBService(self.pool, user_id)
+    def kb_service(self, user_id: str) -> HostedKBService:
+        return HostedKBService(self.pool, user_id, self.s3)
 
     def document_service(self, user_id: str) -> HostedDocumentService:
         return HostedDocumentService(self.pool, user_id, self.s3)
+
+    def public_wiki_service(self) -> HostedPublicWikiService:
+        return HostedPublicWikiService(self.pool, self.s3)

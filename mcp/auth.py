@@ -2,10 +2,10 @@ import asyncio
 import logging
 
 import jwt as pyjwt
-from jwt import PyJWKClient
-from mcp.server.auth.provider import AccessToken, TokenVerifier
-
 from config import settings
+from jwt import PyJWKClient
+
+from mcp.server.auth.provider import AccessToken, TokenVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,9 @@ def _get_jwks_client() -> PyJWKClient:
     return _jwks_client
 
 
+_EXPECTED_ISSUER = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1"
+
+
 class SupabaseTokenVerifier(TokenVerifier):
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -32,9 +35,23 @@ class SupabaseTokenVerifier(TokenVerifier):
                 signing_key.key,
                 algorithms=["RS256", "ES256"],
                 audience="authenticated",
+                issuer=_EXPECTED_ISSUER,
+                leeway=30,
+                options={
+                    "require": ["exp", "iat", "sub", "aud", "iss"],
+                    "verify_exp": True,
+                    "verify_iat": True,
+                    "verify_nbf": True,
+                },
             )
-        except Exception as e:
-            logger.debug("JWT verification failed: %s", e)
+        except pyjwt.ExpiredSignatureError:
+            logger.info("MCP auth rejected: token expired")
+            return None
+        except pyjwt.PyJWTError as e:
+            logger.info("MCP auth rejected: %s: %s", type(e).__name__, e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("MCP auth rejected: JWKS fetch failed: %s", e)
             return None
 
         sub = payload.get("sub", "")

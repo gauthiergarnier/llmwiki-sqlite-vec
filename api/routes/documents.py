@@ -1,11 +1,21 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-
+from auth import get_current_user
 from deps import get_document_service
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from infra.rate_limit import limiter
 from services.base import DocumentService
-from services.types import CreateNote, UpdateContent, UpdateMetadata, BulkDelete
+from services.types import (
+    BulkDelete,
+    CreateFromUrl,
+    CreateNote,
+    CreateWebClip,
+    UpdateContent,
+    UpdateMetadata,
+    UpsertHighlight,
+)
+from services.url_ingest import UrlIngestService
 
 router = APIRouter(tags=["documents"])
 
@@ -17,6 +27,17 @@ async def list_documents(
     path: str | None = Query(None),
 ):
     return await service.list(str(kb_id), path)
+
+
+@router.get("/v1/documents/by-url")
+async def get_document_by_url(
+    service: Annotated[DocumentService, Depends(get_document_service)],
+    url: str = Query(..., max_length=2048),
+):
+    row = await service.get_by_source_url(url)
+    if not row:
+        raise HTTPException(status_code=404, detail="No document found for URL")
+    return row
 
 
 @router.get("/v1/documents/{doc_id}")
@@ -52,6 +73,81 @@ async def create_note(
     return await service.create_note(str(kb_id), body.filename, body.path, body.content)
 
 
+@router.post("/v1/knowledge-bases/{kb_id}/documents/web", status_code=201)
+@limiter.limit("30/minute")
+async def create_web_clip(
+    request: Request,
+    kb_id: UUID,
+    body: CreateWebClip,
+    service: Annotated[DocumentService, Depends(get_document_service)],
+):
+    highlights = [h.model_dump() for h in body.highlights] if body.highlights else None
+    return await service.create_web_clip(
+        str(kb_id), body.url, body.title, body.html, highlights, body.path,
+    )
+
+
+@router.post("/v1/documents/from-url", status_code=201)
+@limiter.limit("10/minute")
+async def create_document_from_url(request: Request, body: CreateFromUrl):
+    user_id = await get_current_user(request)
+    state = request.app.state
+    if not state.s3_service or not state.ocr_service:
+        raise HTTPException(status_code=501, detail="URL ingestion is only available in hosted mode")
+    service = UrlIngestService(state.pool, state.s3_service, state.ocr_service)
+    return await service.ingest_pdf(user_id, str(body.knowledge_base_id), body.url, body.path)
+
+
+@router.get("/v1/documents/{doc_id}/highlights")
+async def get_document_highlights(
+    doc_id: UUID,
+    service: Annotated[DocumentService, Depends(get_document_service)],
+):
+    row = await service.get_highlights(str(doc_id))
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return row
+
+
+@router.post("/v1/documents/{doc_id}/highlights", status_code=200)
+async def upsert_document_highlight(
+    doc_id: UUID,
+    body: UpsertHighlight,
+    service: Annotated[DocumentService, Depends(get_document_service)],
+):
+    """Idempotently upsert one highlight by id; safe to retry."""
+    row = await service.upsert_highlight(
+        str(doc_id), body.highlight.model_dump(), body.expectedVersion,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if row.get("conflict"):
+        raise HTTPException(
+            status_code=409,
+            detail="Version mismatch — refetch and retry",
+        )
+    return row
+
+
+@router.delete("/v1/documents/{doc_id}/highlights/{highlight_id}", status_code=200)
+async def delete_document_highlight(
+    doc_id: UUID,
+    highlight_id: str,
+    service: Annotated[DocumentService, Depends(get_document_service)],
+    expectedVersion: int | None = Query(None),
+):
+    """Idempotently delete one highlight (absent id is a no-op); `expectedVersion` is a query param since DELETE bodies are unreliable."""
+    row = await service.delete_highlight(str(doc_id), highlight_id, expectedVersion)
+    if not row:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if row.get("conflict"):
+        raise HTTPException(
+            status_code=409,
+            detail="Version mismatch — refetch and retry",
+        )
+    return row
+
+
 @router.put("/v1/documents/{doc_id}/content")
 async def update_document_content(
     doc_id: UUID,
@@ -70,13 +166,16 @@ async def update_document_metadata(
     body: UpdateMetadata,
     service: Annotated[DocumentService, Depends(get_document_service)],
 ):
-    fields = {k: v for k, v in body.model_dump().items() if v is not None}
+    fields = body.changed_fields()
     if not fields:
         raise HTTPException(status_code=400, detail="No fields to update")
     row = await service.update_metadata(str(doc_id), fields)
     if not row:
         raise HTTPException(status_code=404, detail="Document not found")
     return row
+
+
+_BULK_DELETE_MAX_IDS = 100
 
 
 @router.post("/v1/documents/bulk-delete", status_code=204)
@@ -86,6 +185,11 @@ async def bulk_delete_documents(
 ):
     if not body.ids:
         return
+    if len(body.ids) > _BULK_DELETE_MAX_IDS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many ids: max {_BULK_DELETE_MAX_IDS} per request",
+        )
     await service.bulk_delete(body.ids)
 
 

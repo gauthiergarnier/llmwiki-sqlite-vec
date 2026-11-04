@@ -1,8 +1,7 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends
-
 from deps import get_user_service
+from fastapi import APIRouter, Depends
 from services.base import UserService
 from services.types import MeResponse
 

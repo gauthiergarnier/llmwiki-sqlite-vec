@@ -38,7 +38,7 @@ export function SidenavUserMenu() {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button className="flex items-center gap-2 w-full px-2 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer">
+        <button className="flex items-center gap-2 w-full px-2 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-sidebar-accent rounded-md transition-colors cursor-pointer">
           <div className="h-5 w-5 bg-muted border border-border rounded flex items-center justify-center shrink-0">
             <span className="text-[8px] font-medium">{initials}</span>
           </div>

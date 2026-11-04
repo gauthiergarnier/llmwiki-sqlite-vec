@@ -1,32 +1,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Literal
 
 from bs4.element import Tag
+
+FormElementType = Literal["input", "button", "select", "textarea"]
 
 
 @dataclass
 class FormElement:
-    type: str  # "input", "button", "select", "textarea"
+    type: FormElementType
     name: str = ""
     label: str = ""
     value: str = ""
-    options: List[str] = field(default_factory=list)
+    options: list[str] = field(default_factory=list)
 
 
 class FormExtractor:
 
     def __init__(self):
-        self.elements: List[FormElement] = []
+        self.elements: list[FormElement] = []
 
-    def process_form(self, node: Tag, inner: str) -> str:
+    @staticmethod
+    def form_header(node: Tag) -> str:
         action = node.get("action", "")
         method = (node.get("method") or "GET").upper()
-        header = f"[Form: {method} {action}]" if action else "[Form]"
-        if inner.strip():
-            return f"\n\n{header}\n{inner.strip()}\n\n"
-        return ""
+        return f"[Form: {method} {action}]" if action else "[Form]"
 
     def process_input(self, node: Tag) -> str:
         input_type = (node.get("type") or "text").lower()

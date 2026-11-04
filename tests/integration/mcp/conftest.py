@@ -1,11 +1,8 @@
-"""Fixtures for MCP VaultFS and tool handler tests.
-
-Uses SqliteVaultFS with a temp workspace — no Postgres needed.
-"""
+"""SqliteVaultFS fixtures on a temp workspace."""
 
 import json
-import sys
 import os
+import sys
 import uuid
 
 import pytest
@@ -51,18 +48,15 @@ async def insert_page(fs):
 
 @pytest.fixture
 async def insert_chunk(fs):
-    _idx = [0]
-
     async def _insert(doc_id: str, kb_id: str, content: str, page: int = 1, breadcrumb: str = ""):
         from vaultfs.sqlite import SqliteVaultFS
         db = SqliteVaultFS._db_or_raise()
-        chunk_id = str(uuid.uuid4())
         await db.execute(
             "INSERT INTO document_chunks (id, document_id, "
             "chunk_index, content, page, header_breadcrumb, token_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, 10)",
-            (chunk_id, doc_id, _idx[0], content, page, breadcrumb),
+            "SELECT ?, ?, COALESCE(MAX(chunk_index), -1) + 1, ?, ?, ?, 10 "
+            "FROM document_chunks WHERE document_id = ?",
+            (str(uuid.uuid4()), doc_id, content, page, breadcrumb, doc_id),
         )
-        _idx[0] += 1
         await db.commit()
     return _insert

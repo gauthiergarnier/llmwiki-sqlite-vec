@@ -1,14 +1,10 @@
-"""Search tool — browse, search, and query references in the knowledge vault."""
-
-import logging
 from typing import Literal
 
-from mcp.server.fastmcp import FastMCP, Context
-
 from vaultfs import VaultFS
-from .helpers import deep_link, glob_match, resolve_path, MAX_LIST, MAX_SEARCH
 
-logger = logging.getLogger(__name__)
+from mcp.server.fastmcp import Context, FastMCP
+
+from .helpers import MAX_LIST, MAX_SEARCH, deep_link, glob_match, resolve_path
 
 _CONTEXT_CHARS = 120
 
@@ -31,8 +27,6 @@ def _extract_snippet(content: str, query: str) -> str:
 
 
 class SearchHandler:
-    """Executes list, search, and reference queries on the knowledge vault."""
-
     def __init__(self, fs: VaultFS, kb: dict):
         self.fs = fs
         self.kb = kb
@@ -57,7 +51,13 @@ class SearchHandler:
         sources = [d for d in docs if not d["path"].startswith("/wiki/")]
         wiki_pages = [d for d in docs if d["path"].startswith("/wiki/")]
 
-        lines = [f"**{self.kb['name']}** (`{target}`):\n"]
+        scope_parts = []
+        if target not in ("*", "**", "**/*"):
+            scope_parts.append(f"`{target}`")
+        if tags:
+            scope_parts.append(f"tags: {', '.join(tags)}")
+        scope = f" ({' — '.join(scope_parts)})" if scope_parts else ""
+        lines = [f"**{self.kb['name']}**{scope}:\n"]
 
         if sources:
             lines.append(f"**Sources ({len(sources)}):**")
@@ -75,18 +75,30 @@ class SearchHandler:
 
         return "\n".join(lines)
 
-    async def search_chunks(self, query: str, path: str, tags: list[str] | None, limit: int) -> str:
-        """Full-text search across document chunks."""
+    async def search_chunks(
+        self, query: str, path: str, tags: list[str] | None, limit: int,
+        annotated_only: bool = False, scope: str = "all",
+    ) -> str:
+        """Full-text search across chunks; `scope` is all, annotations (user notes/quotes), or source."""
         path_filter = self._path_filter_key(path)
 
-        matches = await self.fs.search_chunks(self.kb_id, query, limit, path_filter)
+        matches = await self.fs.search_chunks(
+            self.kb_id, query, limit, path_filter,
+            annotated_only=annotated_only, scope=scope,
+        )
+        matches = self._apply_path_glob(matches, path)
 
         if tags:
             tag_set = {t.lower() for t in tags}
             matches = [m for m in matches if tag_set.issubset({t.lower() for t in (m.get("tags") or [])})]
 
         if not matches:
-            return f"No matches for `{query}` in {self.slug}."
+            scope_msg = ""
+            if scope != "all":
+                scope_msg = f" (scope: {scope})"
+            if annotated_only:
+                scope_msg = f" (annotated only{scope_msg})"
+            return f"No matches for `{query}` in {self.slug}{scope_msg}."
 
         lines = [f"**{len(matches)} result(s)** for `{query}`:\n"]
         for m in matches:
@@ -170,7 +182,7 @@ class SearchHandler:
         return "\n".join(lines)
 
     def _path_filter_key(self, path: str) -> str | None:
-        """Map a path pattern to a search filter key."""
+        """Map a path pattern to a coarse wiki/sources search filter key."""
         if path in ("*", "**", "**/*"):
             return None
         if path.startswith("/wiki"):
@@ -179,8 +191,14 @@ class SearchHandler:
             return "sources"
         return None
 
+    def _apply_path_glob(self, matches: list[dict], path: str) -> list[dict]:
+        """Apply file-level globs the coarse SQL wiki/sources filter can't express."""
+        if path in ("*", "**", "**/*") or not ("*" in path or "?" in path):
+            return matches
+        glob_pat = path if path.startswith("/") else "/" + path.lstrip("/")
+        return [m for m in matches if glob_match(m["path"] + m["filename"], glob_pat)]
+
     def _format_source_line(self, doc: dict) -> str:
-        """Format a single source document for list output."""
         tag_str = f" [{', '.join(doc['tags'])}]" if doc.get("tags") else ""
         date_part = ""
         if doc.get("updated_at"):
@@ -190,7 +208,6 @@ class SearchHandler:
         return f"  {doc['path']}{doc['filename']} ({doc.get('file_type', '')}{pages_part}{date_part}){tag_str}"
 
     def _format_wiki_line(self, doc: dict) -> str:
-        """Format a single wiki page for list output."""
         date_part = ""
         if doc.get("updated_at"):
             date_val = doc["updated_at"]
@@ -198,19 +215,28 @@ class SearchHandler:
         return f"  {doc['path']}{doc['filename']}{date_part}"
 
     def _format_search_result(self, match: dict, query: str) -> str:
-        """Format a single search result with snippet."""
+        """Format a result whose snippet comes from the materialized content, so source and annotations are already stitched."""
         filepath = f"{match['path']}{match['filename']}"
         page_str = f" (p.{match['page']})" if match.get("page") else ""
         breadcrumb = f"\n  {match['header_breadcrumb']}" if match.get("header_breadcrumb") else ""
-        snippet = _extract_snippet(match.get("content", ""), query)
         link = deep_link(self.slug, match["path"], match["filename"])
         score = match.get("score", 0)
         score_str = f" [{score:.1f}]" if score else ""
-        return f"**{filepath}**{page_str}{score_str} — [view]({link}){breadcrumb}\n```\n{snippet}\n```\n"
+
+        # "note" = user's voice, "source" = doc body; [annotated] means the chunk has notes but only the source matched.
+        marker = ""
+        if match.get("annotation_hit") and not match.get("source_hit"):
+            marker = " [matched: note]"
+        elif match.get("annotation_hit"):
+            marker = " [matched: source+note]"
+        elif match.get("has_highlight"):
+            marker = " [annotated]"
+
+        snippet = _extract_snippet(match.get("content", ""), query)
+        return f"**{filepath}**{page_str}{score_str}{marker} — [view]({link}){breadcrumb}\n```\n{snippet}\n```\n"
 
 
 async def _list_all_kbs(fs: VaultFS) -> str:
-    """List all knowledge bases for the user."""
     kbs = await fs.list_knowledge_bases()
     if not kbs:
         return "No knowledge bases found."
@@ -249,6 +275,8 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
         path: str = "*",
         tags: list[str] | None = None,
         limit: int = 10,
+        annotated_only: bool = False,
+        scope: Literal["all", "annotations", "source"] = "all",
     ) -> str:
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
@@ -264,11 +292,14 @@ def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
 
         if mode == "list":
             return await handler.list_documents(path, tags)
-        elif mode == "search":
+        if mode == "search":
             if not query:
                 return "search mode requires a query."
-            return await handler.search_chunks(query, path, tags, min(limit, MAX_SEARCH))
-        elif mode == "references":
+            return await handler.search_chunks(
+                query, path, tags, min(limit, MAX_SEARCH),
+                annotated_only=annotated_only, scope=scope,
+            )
+        if mode == "references":
             return await handler.query_references(path, query)
 
         return f"Unknown mode: {mode}"

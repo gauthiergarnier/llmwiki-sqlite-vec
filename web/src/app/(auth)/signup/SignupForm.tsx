@@ -1,15 +1,25 @@
 'use client'
 
-import { useState } from 'react'
+import { Suspense, useEffect, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
+import { rememberReturnPath, safeReturnPath, withReturnTo } from '@/lib/returnTo'
 
-export function SignupForm() {
+function SignupFormInner() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const router = useRouter()
+  const searchParams = useSearchParams()
+  const returnTo = searchParams.get('returnTo')
+
+  useEffect(() => {
+    const supabase = createClient()
+    supabase.auth.getUser().then(({ data: { user } }) => {
+      if (user) router.replace(safeReturnPath(returnTo))
+    })
+  }, [router, returnTo])
 
   async function handleSignup(e: React.FormEvent) {
     e.preventDefault()
@@ -26,12 +36,12 @@ export function SignupForm() {
       setError(error.message)
       setLoading(false)
     } else {
-      router.push('/onboarding')
-      router.refresh()
+      router.push(returnTo ? safeReturnPath(returnTo) : '/onboarding')
     }
   }
 
   async function handleGoogle() {
+    rememberReturnPath(safeReturnPath(returnTo))
     const supabase = createClient()
     await supabase.auth.signInWithOAuth({
       provider: 'google',
@@ -103,7 +113,7 @@ export function SignupForm() {
         </form>
         <p className="text-center text-sm text-muted-foreground">
           Already have an account?{' '}
-          <a href="/login" className="font-medium text-foreground underline">Sign in</a>
+          <a href={withReturnTo('/login', returnTo)} className="font-medium text-foreground underline">Sign in</a>
         </p>
         <p className="text-center text-xs text-muted-foreground/60">
           By signing up, you agree to our{' '}
@@ -113,5 +123,13 @@ export function SignupForm() {
         </p>
       </div>
     </div>
+  )
+}
+
+export function SignupForm() {
+  return (
+    <Suspense>
+      <SignupFormInner />
+    </Suspense>
   )
 }

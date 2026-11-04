@@ -5,17 +5,28 @@ import { useRouter } from 'next/navigation'
 import { motion } from 'framer-motion'
 import { useKBStore, useUserStore } from '@/stores'
 import {
-  Plus, Loader2, Upload, LogOut, Moon, Sun, BookOpen,
+  Plus, Loader2, LogOut, Moon, Sun, BookOpen, AlertCircle, RefreshCcw,
+  EllipsisVertical, Pencil, Trash2,
 } from 'lucide-react'
+import { toast } from 'sonner'
+import type { KnowledgeBase } from '@/lib/types'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter,
 } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
+import { ConfirmDialog } from '@/components/dialogs/ConfirmDialog'
+import { NameDialog } from '@/components/dialogs/NameDialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   DropdownMenuItem, DropdownMenuSeparator,
 } from '@/components/ui/dropdown-menu'
 import { useTheme } from 'next-themes'
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
+
+function wikiHref(slug: string): string {
+  return `/wikis/${slug}`
+}
 
 function relativeTime(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
@@ -35,11 +46,23 @@ export default function WikisPage() {
   const router = useRouter()
   const knowledgeBases = useKBStore((s) => s.knowledgeBases)
   const loading = useKBStore((s) => s.loading)
+  const error = useKBStore((s) => s.error)
+  const retryFetchKBs = useKBStore((s) => s.fetchKBs)
   const createKB = useKBStore((s) => s.createKB)
   const user = useUserStore((s) => s.user)
   const [creating, setCreating] = React.useState(false)
   const [dialogOpen, setDialogOpen] = React.useState(false)
   const [name, setName] = React.useState('')
+  const [kind, setKind] = React.useState<'wiki' | 'course'>('wiki')
+  const [openingSlug, setOpeningSlug] = React.useState<string | null>(null)
+  const [, startNavigation] = React.useTransition()
+
+  const openWiki = React.useCallback((slug: string) => {
+    setOpeningSlug(slug)
+    startNavigation(() => {
+      router.push(wikiHref(slug))
+    })
+  }, [router])
 
   const handleQuickCreate = async () => {
     setCreating(true)
@@ -47,7 +70,7 @@ export default function WikisPage() {
       const email = user?.email || 'My'
       const displayName = email.split('@')[0].charAt(0).toUpperCase() + email.split('@')[0].slice(1)
       const kb = await createKB(`${displayName}'s Wiki`)
-      router.push(`/wikis/${kb.slug}`)
+      openWiki(kb.slug)
     } catch (err) {
       console.error('Failed to create KB:', err)
     } finally {
@@ -59,14 +82,23 @@ export default function WikisPage() {
     if (!name.trim()) return
     setCreating(true)
     try {
-      const kb = await createKB(name.trim())
+      const kb = await createKB(name.trim(), undefined, kind)
       setDialogOpen(false)
       setName('')
-      router.push(`/wikis/${kb.slug}`)
+      setKind('wiki')
+      openWiki(kb.slug)
     } catch (err) {
       console.error('Failed to create KB:', err)
     } finally {
       setCreating(false)
+    }
+  }
+
+  const handleDialogOpenChange = (open: boolean) => {
+    setDialogOpen(open)
+    if (!open) {
+      setName('')
+      setKind('wiki')
     }
   }
 
@@ -78,10 +110,40 @@ export default function WikisPage() {
     )
   }
 
+  if (error) {
+    return (
+      <div className="h-full flex flex-col">
+        <PageHeader onNew={isLocal ? undefined : () => setDialogOpen(true)} />
+        <div className="flex-1 flex items-center justify-center p-8">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card p-5 shadow-sm">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md bg-destructive/10 text-destructive">
+                <AlertCircle className="size-4" />
+              </div>
+              <div className="min-w-0">
+                <h1 className="text-sm font-semibold text-foreground">Could not load wikis</h1>
+                <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                  {error}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => retryFetchKBs()}
+              className="mt-4 inline-flex h-9 w-full items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+            >
+              <RefreshCcw className="size-4" />
+              Retry
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   if (knowledgeBases.length === 0) {
     return (
       <div className="h-full flex flex-col">
-        <PageHeader onNew={() => setDialogOpen(true)} />
+        <PageHeader onNew={isLocal ? undefined : () => setDialogOpen(true)} />
         <div className="flex-1 flex flex-col items-center justify-center p-8">
           <div className="w-full max-w-2xl">
             <div className="text-center mb-12">
@@ -154,9 +216,11 @@ export default function WikisPage() {
 
         <CreateWikiDialog
           open={dialogOpen}
-          onOpenChange={setDialogOpen}
+          onOpenChange={handleDialogOpenChange}
           name={name}
           onNameChange={setName}
+          kind={kind}
+          onKindChange={setKind}
           creating={creating}
           onCreate={handleCreate}
         />
@@ -166,69 +230,41 @@ export default function WikisPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <PageHeader onNew={() => setDialogOpen(true)} />
+      <PageHeader onNew={isLocal ? undefined : () => setDialogOpen(true)} />
 
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-4xl mx-auto px-8 py-6">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {knowledgeBases.map((kb, index) => {
-              const stats: string[] = []
-              if (kb.source_count > 0) stats.push(`${kb.source_count} source${kb.source_count !== 1 ? 's' : ''}`)
-              if (kb.wiki_page_count > 0) stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+            {knowledgeBases.map((kb, index) => (
+              <WikiCard
+                key={kb.id}
+                kb={kb}
+                index={index}
+                isOpening={openingSlug === kb.slug}
+                onOpen={() => openWiki(kb.slug)}
+              />
+            ))}
 
-              return (
-                <motion.div
-                  key={kb.id}
-                  initial={{ opacity: 0, y: 12 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.3, delay: index * 0.05, ease: [0.25, 0.1, 0.25, 1] }}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => router.push(`/wikis/${kb.slug}`)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') router.push(`/wikis/${kb.slug}`) }}
-                  className="flex flex-col items-start gap-3 p-5 rounded-xl border border-border bg-card hover:bg-accent/50 transition-colors cursor-pointer text-left group overflow-hidden"
-                >
-                  <div className="flex items-center gap-3 min-w-0 w-full">
-                    <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted group-hover:bg-accent transition-colors flex-shrink-0">
-                      <BookOpen size={16} className="text-muted-foreground group-hover:text-foreground transition-colors" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <h2 className="text-sm font-medium text-foreground truncate">{kb.name}</h2>
-                      {kb.description && (
-                        <p className="text-xs text-muted-foreground mt-0.5 truncate">{kb.description}</p>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-2 text-[11px] text-muted-foreground/50 w-full">
-                    {stats.length > 0 ? (
-                      <span>{stats.join(' \u00B7 ')}</span>
-                    ) : (
-                      <span className="text-muted-foreground/30">No sources yet</span>
-                    )}
-                    <span className="ml-auto text-muted-foreground/30 shrink-0">
-                      {relativeTime(kb.updated_at)}
-                    </span>
-                  </div>
-                </motion.div>
-              )
-            })}
-
-            <button
-              onClick={() => setDialogOpen(true)}
-              className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-dashed border-border hover:border-primary/50 hover:bg-accent/30 transition-colors cursor-pointer min-h-[112px]"
-            >
-              <Plus size={16} className="text-muted-foreground" />
-              <span className="text-xs text-muted-foreground">New Wiki</span>
-            </button>
+            {!isLocal && (
+              <button
+                onClick={() => setDialogOpen(true)}
+                className="flex flex-col items-center justify-center gap-2 p-5 rounded-xl border border-dashed border-border hover:border-primary/50 hover:bg-accent/30 transition-colors cursor-pointer min-h-[112px]"
+              >
+                <Plus size={16} className="text-muted-foreground" />
+                <span className="text-xs text-muted-foreground">New Wiki</span>
+              </button>
+            )}
           </div>
         </div>
       </div>
 
       <CreateWikiDialog
         open={dialogOpen}
-        onOpenChange={setDialogOpen}
+        onOpenChange={handleDialogOpenChange}
         name={name}
         onNameChange={setName}
+        kind={kind}
+        onKindChange={setKind}
         creating={creating}
         onCreate={handleCreate}
       />
@@ -236,10 +272,240 @@ export default function WikisPage() {
   )
 }
 
+function WikiCard({
+  kb,
+  index,
+  isOpening,
+  onOpen,
+}: {
+  kb: KnowledgeBase
+  index: number
+  isOpening: boolean
+  onOpen: () => void
+}) {
+  const renameKB = useKBStore((s) => s.renameKB)
+  const deleteKB = useKBStore((s) => s.deleteKB)
+  const [renameOpen, setRenameOpen] = React.useState(false)
+  const [deleteOpen, setDeleteOpen] = React.useState(false)
+  const [renameName, setRenameName] = React.useState(kb.name)
+  const [busy, setBusy] = React.useState(false)
+  const menuTriggerRef = React.useRef<HTMLButtonElement>(null)
+
+  // After a successful delete the card is gone — fall back to the page title.
+  const restoreFocus = React.useCallback((event: Event) => {
+    event.preventDefault()
+    const trigger = menuTriggerRef.current
+    if (trigger && trigger.isConnected) {
+      trigger.focus()
+      return
+    }
+    document.getElementById('wikis-page-title')?.focus()
+  }, [])
+
+  const lessonCount = kb.lesson_count ?? 0
+  const lessonsCompleted = kb.lessons_completed ?? 0
+  const isCourseWithLessons = kb.kind === 'course' && lessonCount > 0
+
+  const stats: string[] = []
+  if (kb.source_count > 0) stats.push(`${kb.source_count} source${kb.source_count !== 1 ? 's' : ''}`)
+  if (isCourseWithLessons) {
+    stats.push(`${lessonsCompleted}/${lessonCount} lessons`)
+  } else if (kb.wiki_page_count > 0) {
+    stats.push(`${kb.wiki_page_count} page${kb.wiki_page_count !== 1 ? 's' : ''}`)
+  }
+
+  const handleRename = async () => {
+    const next = renameName.trim()
+    if (!next || next === kb.name || busy) return
+    setBusy(true)
+    try {
+      await renameKB(kb.id, next)
+      setRenameOpen(false)
+    } catch {
+      toast.error('Failed to rename wiki')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    if (busy) return
+    setBusy(true)
+    try {
+      await deleteKB(kb.id)
+      setDeleteOpen(false)
+    } catch {
+      toast.error('Failed to delete wiki')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <motion.div
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.3, delay: index * 0.05, ease: [0.25, 0.1, 0.25, 1] }}
+        role="button"
+        tabIndex={0}
+        onClick={onOpen}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            onOpen()
+          }
+        }}
+        className="flex flex-col items-start gap-3 p-5 rounded-xl border border-border bg-card hover:bg-accent/50 transition-colors cursor-pointer text-left group overflow-hidden"
+      >
+        <div className="flex items-center gap-3 min-w-0 w-full">
+          {isCourseWithLessons && !isOpening ? (
+            <ProgressDonut
+              percent={(lessonsCompleted / lessonCount) * 100}
+              label={`${lessonsCompleted} of ${lessonCount} lessons complete`}
+            />
+          ) : (
+            <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-muted group-hover:bg-accent transition-colors flex-shrink-0">
+              {isOpening ? (
+                <Loader2 size={16} className="animate-spin text-muted-foreground" />
+              ) : (
+                <BookOpen size={16} className="text-muted-foreground group-hover:text-foreground transition-colors" />
+              )}
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-medium text-foreground truncate">{kb.name}</h2>
+            {kb.description && (
+              <p className="text-xs text-muted-foreground mt-0.5 truncate">{kb.description}</p>
+            )}
+          </div>
+          {/* Menu events must not reach the card's open handler. */}
+          <span
+            className="shrink-0 -mr-2"
+            onClick={(e) => e.stopPropagation()}
+            onKeyDown={(e) => e.stopPropagation()}
+          >
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button
+                  ref={menuTriggerRef}
+                  aria-label="Wiki actions"
+                  className="flex items-center justify-center size-7 rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-accent opacity-0 group-hover:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100 transition-opacity cursor-pointer"
+                >
+                  <EllipsisVertical className="size-3.5" />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-36">
+                <DropdownMenuItem
+                  onSelect={() => {
+                    setRenameName(kb.name)
+                    setRenameOpen(true)
+                  }}
+                >
+                  <Pencil />
+                  Rename
+                </DropdownMenuItem>
+                {!isLocal && (
+                  <DropdownMenuItem variant="destructive" onSelect={() => setDeleteOpen(true)}>
+                    <Trash2 />
+                    Delete
+                  </DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground/50 w-full">
+          {stats.length > 0 ? (
+            <span>{stats.join(' · ')}</span>
+          ) : (
+            <span className="text-muted-foreground/30">No sources yet</span>
+          )}
+          <span className="ml-auto text-muted-foreground/30 shrink-0">
+            {relativeTime(kb.updated_at)}
+          </span>
+        </div>
+      </motion.div>
+
+      <NameDialog
+        open={renameOpen}
+        onOpenChange={setRenameOpen}
+        title="Rename wiki"
+        value={renameName}
+        onValueChange={setRenameName}
+        submitLabel="Rename"
+        busyLabel="Renaming…"
+        busy={busy}
+        submitDisabled={renameName.trim() === kb.name}
+        onSubmit={handleRename}
+        onCloseAutoFocus={restoreFocus}
+      />
+
+      {!isLocal && (
+        <ConfirmDialog
+          open={deleteOpen}
+          onOpenChange={setDeleteOpen}
+          title="Delete wiki"
+          description={<>This permanently deletes <strong>{kb.name}</strong> and all its sources and wiki pages. This cannot be undone.</>}
+          confirmLabel="Delete"
+          busyLabel="Deleting…"
+          busy={busy}
+          onConfirm={handleDelete}
+          destructive
+          confirmText={kb.name}
+          onCloseAutoFocus={restoreFocus}
+        />
+      )}
+    </>
+  )
+}
+
+const DONUT_SIZE = 36
+const DONUT_STROKE = 3.5
+
+function ProgressDonut({ percent, label }: { percent: number; label: string }) {
+  const clamped = Math.min(100, Math.max(0, percent))
+  const radius = (DONUT_SIZE - DONUT_STROKE) / 2
+  const circumference = 2 * Math.PI * radius
+  const complete = clamped >= 100
+  return (
+    <div
+      title={label}
+      className="relative flex items-center justify-center flex-shrink-0"
+      style={{ width: DONUT_SIZE, height: DONUT_SIZE }}
+    >
+      <svg width={DONUT_SIZE} height={DONUT_SIZE} className="-rotate-90">
+        <circle
+          cx={DONUT_SIZE / 2}
+          cy={DONUT_SIZE / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={DONUT_STROKE}
+          className="stroke-border"
+        />
+        <circle
+          cx={DONUT_SIZE / 2}
+          cy={DONUT_SIZE / 2}
+          r={radius}
+          fill="none"
+          strokeWidth={DONUT_STROKE}
+          strokeLinecap="round"
+          strokeDasharray={circumference}
+          strokeDashoffset={circumference * (1 - clamped / 100)}
+          className={`transition-[stroke-dashoffset] duration-500 ${complete ? 'stroke-emerald-500' : 'stroke-foreground'}`}
+        />
+      </svg>
+      <span className={`absolute text-[8px] font-semibold tabular-nums ${complete ? 'text-emerald-600 dark:text-emerald-500' : 'text-foreground'}`}>
+        {Math.round(clamped)}%
+      </span>
+    </div>
+  )
+}
+
 function PageHeader({ onNew }: { onNew?: () => void }) {
   return (
     <div className="shrink-0 flex items-center justify-between px-6 h-12 border-b border-border">
-      <span className="text-sm font-medium text-foreground tracking-tight">LLM Wiki</span>
+      <span id="wikis-page-title" tabIndex={-1} className="text-sm font-medium text-foreground tracking-tight outline-none">LLM Wiki</span>
       <div className="flex items-center gap-1">
         {onNew && (
           <button
@@ -314,6 +580,8 @@ function CreateWikiDialog({
   onOpenChange,
   name,
   onNameChange,
+  kind,
+  onKindChange,
   creating,
   onCreate,
 }: {
@@ -321,31 +589,41 @@ function CreateWikiDialog({
   onOpenChange: (open: boolean) => void
   name: string
   onNameChange: (name: string) => void
+  kind: 'wiki' | 'course'
+  onKindChange: (kind: 'wiki' | 'course') => void
   creating: boolean
   onCreate: () => void
 }) {
+  const isCourse = kind === 'course'
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Create wiki</DialogTitle>
+          <DialogTitle>Create {isCourse ? 'course' : 'wiki'}</DialogTitle>
         </DialogHeader>
-        <input
+        <Input
           value={name}
           onChange={(e) => onNameChange(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && onCreate()}
-          placeholder="My Research"
-          className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+          placeholder={isCourse ? 'Intro to Reinforcement Learning' : 'My Research'}
           autoFocus
         />
-        <DialogFooter>
+        {isCourse && (
+          <p className="-mt-1 text-xs leading-relaxed text-muted-foreground">
+            A course presents your material as ordered lessons with progress tracking and resume, instead of a free-form wiki.
+          </p>
+        )}
+        <DialogFooter className="items-center gap-3 sm:justify-between">
           <button
-            onClick={onCreate}
-            disabled={creating || !name.trim()}
-            className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 cursor-pointer"
+            type="button"
+            onClick={() => onKindChange(isCourse ? 'wiki' : 'course')}
+            className="text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
           >
-            {creating ? 'Creating...' : 'Create'}
+            {isCourse ? 'Back to wiki' : 'Make this a course instead'}
           </button>
+          <Button onClick={onCreate} disabled={creating || !name.trim()}>
+            {creating ? 'Creating…' : `Create ${isCourse ? 'course' : 'wiki'}`}
+          </Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

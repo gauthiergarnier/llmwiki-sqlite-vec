@@ -3,7 +3,7 @@
 import * as React from 'react'
 import { Loader2, RefreshCw } from 'lucide-react'
 import { useUserStore } from '@/stores'
-import { apiFetch } from '@/lib/api'
+import { apiFetch, ApiError } from '@/lib/api'
 import { toast } from 'sonner'
 import dynamic from 'next/dynamic'
 
@@ -39,11 +39,16 @@ interface Props {
   onNavigateToDoc?: (docId: string, sourceKind: string) => void
 }
 
-const NODE_COLOR = 'rgba(140, 140, 150, 0.7)'            // other wiki pages
-const NODE_COLOR_CONCEPT = 'rgba(120, 120, 140, 0.85)'   // concepts — slightly cooler
-const NODE_COLOR_ENTITY = 'rgba(155, 140, 130, 0.85)'    // entities — slightly warmer
-const NODE_COLOR_SOURCE = 'rgba(140, 140, 150, 0.4)'     // sources — faded
-const NODE_COLOR_HOVER = 'rgba(60, 60, 70, 1)'           // hover — dark
+// d3-force keeps x/y/vx/vy on the node objects; reusing them keeps the layout stable across remounts.
+const nodeCacheByKb = new Map<string, Map<string, GraphNode>>()
+
+const NODE_RADIUS = 3.5
+const SOURCE_RADIUS = 2.5
+const NODE_COLOR = 'rgba(140, 140, 150, 0.7)'
+const NODE_COLOR_CONCEPT = 'rgba(120, 120, 140, 0.85)'
+const NODE_COLOR_ENTITY = 'rgba(155, 140, 130, 0.85)'
+const NODE_COLOR_SOURCE = 'rgba(140, 140, 150, 0.4)'
+const NODE_COLOR_HOVER = 'rgba(60, 60, 70, 1)'
 const EDGE_COLOR = 'rgba(140, 140, 150, 0.18)'
 const EDGE_COLOR_HOVER = 'rgba(100, 100, 110, 0.5)'
 
@@ -58,28 +63,46 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
   const [error, setError] = React.useState(false)
   const hoverNodeRef = React.useRef<GraphNode | null>(null)
   const hoverNeighborsRef = React.useRef<Set<string> | null>(null)
-  const connectionCountsRef = React.useRef<Map<string, { outbound: number; inbound: number }>>(new Map())
   const [hoverNodeState, setHoverNodeState] = React.useState<GraphNode | null>(null)
   const [mousePos, setMousePos] = React.useState({ x: 0, y: 0 })
   const [dimensions, setDimensions] = React.useState({ width: 0, height: 0 })
   const [showSources, setShowSources] = React.useState(false)
 
+  // Only the latest in-flight fetch may apply its result.
+  const fetchSeqRef = React.useRef(0)
+
   const fetchGraph = React.useCallback(() => {
     if (!token) return
+    const seq = ++fetchSeqRef.current
     setLoading(true)
     setError(false)
     apiFetch<{ nodes: GraphNode[]; edges: GraphEdge[] }>(
       `/v1/knowledge-bases/${kbId}/graph`,
       token,
     )
-      .then(setGraphData)
-      .catch(() => setError(true))
-      .finally(() => setLoading(false))
+      .then((data) => {
+        if (seq !== fetchSeqRef.current) return
+        setGraphData(data)
+      })
+      .catch(() => {
+        if (seq !== fetchSeqRef.current) return
+        setError(true)
+      })
+      .finally(() => {
+        if (seq !== fetchSeqRef.current) return
+        setLoading(false)
+      })
   }, [kbId, token])
 
   React.useEffect(() => { fetchGraph() }, [fetchGraph])
 
-  // Always track container size — ref is always mounted
+  // A cites-only wiki would look empty under the wiki-only default, so show sources.
+  React.useEffect(() => {
+    if (!graphData || focusNodeId) return
+    const hasWikiLinks = graphData.edges.some((e) => e.type === 'links_to')
+    if (!hasWikiLinks && graphData.edges.length > 0) setShowSources(true)
+  }, [graphData, focusNodeId])
+
   React.useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -111,27 +134,16 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
         toast.success(`${res.citations} citation${res.citations !== 1 ? 's' : ''}, ${res.links} cross-reference${res.links !== 1 ? 's' : ''}`)
       }
       fetchGraph()
-    } catch {
-      toast.error('Failed to rebuild references')
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 429) {
+        toast.info('References were just rebuilt — try again in a minute')
+      } else {
+        toast.error('Failed to rebuild references')
+      }
     } finally {
       setRebuilding(false)
     }
   }, [kbId, token, rebuilding, fetchGraph])
-
-  // Connection counts for tooltip
-  const connectionCounts = React.useMemo(() => {
-    if (!graphData) return new Map<string, { outbound: number; inbound: number }>()
-    const counts = new Map<string, { outbound: number; inbound: number }>()
-    for (const n of graphData.nodes) counts.set(n.id, { outbound: 0, inbound: 0 })
-    for (const e of graphData.edges) {
-      const s = counts.get(e.source)
-      const t = counts.get(e.target)
-      if (s) s.outbound++
-      if (t) t.inbound++
-    }
-    connectionCountsRef.current = counts
-    return counts
-  }, [graphData])
 
   const forceGraphData = React.useMemo(() => {
     if (!graphData) return { nodes: [], links: [] }
@@ -139,7 +151,6 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
     let relevantNodes = graphData.nodes
     let relevantEdges = graphData.edges
 
-    // Local graph mode: show only the focus node's neighborhood
     if (focusNodeId) {
       const neighborIds = new Set<string>([focusNodeId])
       for (const e of graphData.edges) {
@@ -148,25 +159,46 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
       }
       relevantNodes = graphData.nodes.filter((n) => neighborIds.has(n.id))
       relevantEdges = graphData.edges.filter(
-        (e) => neighborIds.has(e.source) && neighborIds.has(e.target),
+        (e) => e.source === focusNodeId || e.target === focusNodeId,
       )
     } else {
-      // Global mode: optionally hide sources
-      if (!showSources) {
-        relevantNodes = relevantNodes.filter((n) => n.source_kind === 'wiki')
-        relevantEdges = relevantEdges.filter((e) => e.type === 'links_to')
-      }
+      const hubTitles = new Set(['overview', 'log'])
+      relevantEdges = relevantEdges.filter(
+        (e) => e.type === 'links_to' || (showSources && e.type === 'cites'),
+      )
+      relevantNodes = relevantNodes.filter((n) => {
+        if (n.source_kind !== 'wiki' && !showSources) return false
+        return !hubTitles.has(n.title.toLowerCase())
+      })
     }
 
     const nodeIds = new Set(relevantNodes.map((n) => n.id))
 
+    let cache = nodeCacheByKb.get(kbId)
+    if (!cache) {
+      cache = new Map()
+      nodeCacheByKb.set(kbId, cache)
+    }
+
+    const nodes = relevantNodes.map((n) => {
+      const cached = cache.get(n.id)
+      if (cached) {
+        // Server payload has no x/y/vx/vy, so simulation state survives the assign.
+        Object.assign(cached, n)
+        return cached
+      }
+      const fresh = { ...n }
+      cache.set(n.id, fresh)
+      return fresh
+    })
+
     return {
-      nodes: relevantNodes.map((n) => ({ ...n })),
+      nodes,
       links: relevantEdges
         .filter((e) => nodeIds.has(e.source) && nodeIds.has(e.target))
         .map((e) => ({ source: e.source, target: e.target, type: e.type })),
     }
-  }, [graphData, showSources, focusNodeId])
+  }, [graphData, showSources, focusNodeId, kbId])
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleNodeClick = React.useCallback(
@@ -183,9 +215,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
       const isFaded = hovering && neighbors && !neighbors.has(node.id)
 
       const isSource = node.source_kind !== 'wiki'
-      const cnts = connectionCountsRef.current.get(node.id)
-      const totalLinks = (cnts?.outbound ?? 0) + (cnts?.inbound ?? 0)
-      const radius = isSource ? 3 : Math.min(3.5 + totalLinks * 0.5, 10)
+      const radius = isSource ? SOURCE_RADIUS : NODE_RADIUS
 
       const p = (node.path || '').toLowerCase()
       const isConcept = p.includes('concepts/')
@@ -208,12 +238,12 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
         ctx.font = `${fontSize}px -apple-system, BlinkMacSystemFont, sans-serif`
         ctx.textAlign = 'center'
         ctx.textBaseline = 'top'
-        ctx.fillStyle = isHover ? '#fff' : 'rgba(180,180,190,0.85)'
+        ctx.fillStyle = isHover ? '#000' : 'rgba(60,60,70,0.8)'
         ctx.fillText(label, node.x!, node.y! + radius + 2)
       }
       ctx.globalAlpha = 1
     },
-    // hoverNodeState triggers a new function ref so ForceGraph repaints on hover change
+    // A new function ref is what makes ForceGraph repaint on hover.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [hoverNodeState],
   )
@@ -263,20 +293,32 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
     [hoverNodeState],
   )
 
-  // Configure forces for better spacing
-  React.useEffect(() => {
-    const fg = graphRef.current
-    if (!fg) return
-    fg.d3Force('charge')?.strength(-200)
-    fg.d3Force('link')?.distance(60)
-    fg.d3ReheatSimulation()
-  }, [forceGraphData])
-
   const hasEdges = forceGraphData.links.length > 0
   const hasNodes = forceGraphData.nodes.length > 0
   const ready = !loading && !error && graphData && hasNodes && hasEdges && dimensions.width > 0
 
-  // Determine overlay content for non-graph states
+  // Must run after ForceGraph2D mounts.
+  React.useEffect(() => {
+    const fg = graphRef.current
+    if (!fg) return
+    fg.d3Force('charge')?.strength(-850)
+    fg.d3Force('link')?.distance(130).strength(0.07)
+
+    let cancelled = false
+    import('d3-force').then(({ forceCollide, forceX, forceY }) => {
+      if (cancelled || graphRef.current !== fg) return
+      fg.d3Force('collide', forceCollide((node: any) =>
+        (node.source_kind !== 'wiki' ? SOURCE_RADIUS : NODE_RADIUS) + 2.5
+      ).iterations(2))
+      fg.d3Force('x', forceX(0).strength(0.03))
+      fg.d3Force('y', forceY(0).strength(0.03))
+      fg.d3ReheatSimulation()
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [forceGraphData, ready])
+
   let overlay: React.ReactNode = null
   if (loading) {
     overlay = <Loader2 className="size-5 animate-spin text-muted-foreground" />
@@ -296,7 +338,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
           disabled={rebuilding}
           className="inline-flex items-center gap-2 rounded-full border border-border px-4 py-1.5 text-xs font-medium hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
         >
-          <RefreshCw className={`size-3 ${rebuilding ? 'animate-spin' : ''}`} />
+          <RefreshCw className={`size-3.5 ${rebuilding ? 'animate-spin' : ''}`} strokeWidth={2.25} />
           {rebuilding ? 'Building...' : 'Build references'}
         </button>
         <p className="text-[11px] text-muted-foreground/50 text-center max-w-xs">
@@ -321,7 +363,7 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
             nodeCanvasObject={nodeCanvasObject}
             nodePointerAreaPaint={(node: any, color: string, ctx: CanvasRenderingContext2D) => {
               ctx.beginPath()
-              ctx.arc(node.x!, node.y!, 8, 0, 2 * Math.PI)
+              ctx.arc(node.x!, node.y!, 5, 0, 2 * Math.PI)
               ctx.fillStyle = color
               ctx.fill()
             }}
@@ -329,15 +371,14 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
             onNodeClick={handleNodeClick}
             linkColor={linkColor}
             linkWidth={0.5}
-            linkDirectionalArrowLength={3}
+            linkDirectionalArrowLength={0}
             linkDirectionalArrowRelPos={1}
             backgroundColor="transparent"
-            cooldownTicks={100}
-            d3AlphaDecay={0.02}
-            d3VelocityDecay={0.3}
+            cooldownTicks={220}
+            d3AlphaDecay={0.01}
+            d3VelocityDecay={0.4}
           />
 
-          {/* Controls */}
           <div className="absolute top-3 right-3 flex items-center gap-3 text-[10px] text-muted-foreground bg-background/80 backdrop-blur-sm px-3 py-1.5 rounded-md border border-border">
             <button
               onClick={() => setShowSources((s) => !s)}
@@ -358,7 +399,6 @@ export function GraphViewer({ kbId, focusNodeId, onNavigateToDoc }: Props) {
             </button>
           </div>
 
-          {/* Hover tooltip — follows cursor */}
           {hoverNodeState && (() => {
             const p = hoverNodeState.path.toLowerCase()
             const category = hoverNodeState.source_kind !== 'wiki'

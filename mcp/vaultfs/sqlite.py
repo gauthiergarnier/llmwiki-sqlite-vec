@@ -1,117 +1,130 @@
-"""SQLite + local filesystem implementation of VaultFS."""
-
+import asyncio
+import contextlib
+import importlib.util
 import json
 import logging
 import os
 import sys
 import uuid
+from datetime import date
 from pathlib import Path
+from types import ModuleType
 
 import aiosqlite
-import sqlite_vec
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "shared"))
-from embedder import EMBEDDING_DIM
+from vaultfs.chunker import chunk_text, store_chunks_sqlite
 
-from .base import VaultFS
+# Fork: shared/ holds the embedder + chunk-vector reconciler (hybrid search).
+# The hosted MCP image ships mcp/ without shared/ but still imports this module — degrade there.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "shared"))
+try:
+    from chunk_vectors import load_sqlite_vec_async, start_vector_sync, stop_vector_sync
+except ImportError:  # pragma: no cover - hosted image
+    async def load_sqlite_vec_async(db) -> bool:
+        return False
+
+    def start_vector_sync(db_path: str) -> None:
+        pass
+
+    async def stop_vector_sync() -> None:
+        pass
+
+from .base import DuplicateDocumentError, VaultFS
+from .highlights import append_reply, find_highlight, parse_highlights_value
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_PATH = Path(__file__).parent.parent.parent / "shared" / "sqlite_schema.sql"
+_MIGRATION_RUNNER_PATH = Path(__file__).parent.parent.parent / "api" / "infra" / "db" / "local_migrations.py"
+
+
+def _load_migration_runner() -> ModuleType:
+    """Load the api migration runner lazily by path; the hosted MCP image ships without api/."""
+    spec = importlib.util.spec_from_file_location("local_migrations", _MIGRATION_RUNNER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 _db: aiosqlite.Connection | None = None
 _workspace_root: Path | None = None
+
+_OVERVIEW_TEMPLATE = """\
+---
+title: Overview
+description: Research hub for {name}.
+date: {date}
+tags: [overview, wiki]
+---
+
+This wiki tracks research on {name}. No sources have been ingested yet.
+
+## Key Findings
+
+No sources ingested yet - add your first source to get started.\
+"""
+
+
+def _fts5_keywords(query: str) -> str:
+    """Quote each term so user text is matched as plain keywords (all must match), never parsed as FTS5 syntax."""
+    return " ".join('"' + term.replace('"', '""') + '"' for term in query.split())
+
+
+_RRF_K = 60
+
+
+def _rrf_combine(fts_rows: list[dict], vec_rows: list[dict], k: int = _RRF_K) -> list[dict]:
+    """Reciprocal Rank Fusion of keyword and vector hits (equal weight), best first.
+
+    Fused rows get a 0–100 score (100 = ranked first by both signals) and a
+    ``_from_vec`` flag so scope filtering can treat semantic hits as source matches.
+    """
+    scores: dict[tuple, float] = {}
+    by_key: dict[tuple, dict] = {}
+    from_vec: set[tuple] = set()
+    for ranked, is_vec in ((fts_rows, False), (vec_rows, True)):
+        for rank, row in enumerate(ranked):
+            key = (row["path"], row["filename"], row["chunk_index"])
+            scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+            by_key.setdefault(key, row)
+            if is_vec:
+                from_vec.add(key)
+    best = 2.0 / (k + 1)
+    fused = []
+    for key in sorted(scores, key=scores.__getitem__, reverse=True):
+        row = dict(by_key[key])
+        row["score"] = round(scores[key] / best * 100, 1)
+        row["_from_vec"] = key in from_vec
+        fused.append(row)
+    return fused
 
 
 def _rows_to_dicts(cursor: aiosqlite.Cursor, rows: list[tuple]) -> list[dict]:
     cols = [d[0] for d in cursor.description]
     results = []
     for row in rows:
-        d = dict(zip(cols, row))
+        d = dict(zip(cols, row, strict=False))
         if "tags" in d and isinstance(d["tags"], str):
             try:
                 d["tags"] = json.loads(d["tags"])
             except (json.JSONDecodeError, TypeError):
                 d["tags"] = []
         if "elements" in d and isinstance(d["elements"], str):
-            try:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
                 d["elements"] = json.loads(d["elements"])
+        if "highlights" in d and isinstance(d["highlights"], str):
+            try:
+                d["highlights"] = json.loads(d["highlights"])
             except (json.JSONDecodeError, TypeError):
-                pass
+                d["highlights"] = []
+        if "metadata" in d and isinstance(d["metadata"], str):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                d["metadata"] = {}
         results.append(d)
     return results
 
 
-def _rrf_combine(fts_results: list[dict], vec_results: list[dict], limit: int, k: int = 60) -> list[dict]:
-    """Reciprocal Rank Fusion: merge FTS5 and vector results with equal weight."""
-    scores: dict[tuple, float] = {}
-    result_map: dict[tuple, dict] = {}
-
-    for rank, r in enumerate(fts_results):
-        key = (r["path"], r["filename"], r["chunk_index"])
-        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
-        result_map[key] = r
-
-    for rank, r in enumerate(vec_results):
-        key = (r["path"], r["filename"], r["chunk_index"])
-        scores[key] = scores.get(key, 0) + 1.0 / (k + rank + 1)
-        if key not in result_map:
-            result_map[key] = r
-
-    sorted_keys = sorted(scores, key=lambda x: scores[x], reverse=True)
-    results = []
-    for key in sorted_keys[:limit]:
-        result = dict(result_map[key])
-        result["score"] = scores[key]
-        results.append(result)
-    return results
-
-
-_BACKFILL_BATCH = 64
-
-
-async def _backfill_embeddings(db: aiosqlite.Connection) -> None:
-    """Backfill embeddings for any chunks missing from chunk_vec."""
-    cursor = await db.execute("SELECT count(*) FROM document_chunks")
-    total = (await cursor.fetchone())[0]
-    if total == 0:
-        return
-    cursor = await db.execute("SELECT count(*) FROM chunk_vec")
-    embedded = (await cursor.fetchone())[0]
-    if embedded >= total:
-        return
-
-    missing = total - embedded
-    logger.info("Backfilling %d chunk embeddings...", missing)
-
-    try:
-        from embedder import embed_texts, serialize_embedding
-    except Exception:
-        logger.warning("Cannot backfill embeddings — embedding model unavailable")
-        return
-
-    cursor = await db.execute(
-        "SELECT id, content FROM document_chunks "
-        "WHERE id NOT IN (SELECT chunk_id FROM chunk_vec)"
-    )
-    rows = await cursor.fetchall()
-
-    for i in range(0, len(rows), _BACKFILL_BATCH):
-        batch = rows[i:i + _BACKFILL_BATCH]
-        ids = [r[0] for r in batch]
-        texts = [r[1] for r in batch]
-        embeddings = embed_texts(texts)
-        await db.executemany(
-            "INSERT INTO chunk_vec (chunk_id, embedding) VALUES (?, ?)",
-            [(cid, serialize_embedding(emb)) for cid, emb in zip(ids, embeddings)],
-        )
-    await db.commit()
-    logger.info("Backfilled %d chunk embeddings", len(rows))
-
-
 class SqliteVaultFS(VaultFS):
-    """SQLite + local filesystem vault."""
-
     def __init__(self, user_id: str):
         self.user_id = user_id
 
@@ -123,27 +136,21 @@ class SqliteVaultFS(VaultFS):
         _workspace_root = Path(workspace_path).resolve()
         db_path = os.path.join(workspace_path, ".llmwiki", "index.db")
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        await asyncio.to_thread(_load_migration_runner().apply_migrations, db_path)
         _db = await aiosqlite.connect(db_path)
-        await _db.enable_load_extension(True)
-        await _db.load_extension(sqlite_vec.loadable_path())
-        await _db.enable_load_extension(False)
         await _db.execute("PRAGMA journal_mode=WAL")
-        await _db.execute("PRAGMA busy_timeout=30000")
         await _db.execute("PRAGMA foreign_keys=ON")
-        if _SCHEMA_PATH.exists():
-            await _db.executescript(_SCHEMA_PATH.read_text())
-            await _db.commit()
-        await _db.execute(
-            f"CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0("
-            f"chunk_id text primary key, embedding float[{EMBEDDING_DIM}])"
-        )
-        await _db.commit()
-        await _backfill_embeddings(_db)
-        logger.info("SQLite initialized (with sqlite-vec): %s", db_path)
+        # Fork: the API, CLI and the vector syncer write concurrently; wait instead of "database is locked".
+        await _db.execute("PRAGMA busy_timeout=30000")
+        # Fork: hybrid search — vec0 for queries; embeddings are filled in the background.
+        if await load_sqlite_vec_async(_db):
+            start_vector_sync(db_path)
+        logger.info("SQLite initialized: %s", db_path)
 
     @staticmethod
     async def close() -> None:
         global _db
+        await stop_vector_sync()
         if _db:
             await _db.close()
             _db = None
@@ -162,25 +169,83 @@ class SqliteVaultFS(VaultFS):
         if not row:
             return None
         cols = [d[0] for d in cursor.description]
-        ws = dict(zip(cols, row))
+        ws = dict(zip(cols, row, strict=False))
         return {"id": ws["id"], "name": ws["name"], "slug": ws["name"]}
 
     async def list_knowledge_bases(self) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
-            "SELECT w.name, w.name as slug, "
+            "SELECT w.id, w.name, w.name as slug, w.description, w.created_at, "
             "(SELECT count(*) FROM documents WHERE source_kind != 'wiki' AND status != 'failed') as source_count, "
             "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_count "
             "FROM workspace w",
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
+    async def create_knowledge_base(self, name: str, description: str | None = None, kind: str = "wiki") -> dict:
+        """Create the local singleton workspace, or return it if already initialized."""
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, name, name as slug, description, kind, created_at FROM workspace LIMIT 1",
+        )
+        row = await cursor.fetchone()
+        if row:
+            existing = _rows_to_dicts(cursor, [row])[0]
+            if kind == "course" and existing["kind"] != "course":
+                await db.execute("UPDATE workspace SET kind = ? WHERE id = ?", ("course", existing["id"]))
+                await db.commit()
+                existing["kind"] = "course"
+            existing["already_exists"] = True
+            existing["local_singleton"] = True
+            return existing
+
+        ws_id = str(uuid.uuid4())
+        await db.execute(
+            "INSERT INTO workspace (id, name, description, kind, user_id) VALUES (?, ?, ?, ?, ?)",
+            (ws_id, name, description or "", kind, self.user_id),
+        )
+        await db.commit()
+
+        await self._scaffold_wiki(ws_id, name)
+        kb = await self.resolve_kb(name)
+        return {
+            **(kb or {"id": ws_id, "name": name, "slug": name}),
+            "description": description or "",
+            "already_exists": False,
+            "local_singleton": True,
+        }
+
+    async def update_knowledge_base(self, kb_id: str, name: str | None = None, description: str | None = None, kind: str | None = None) -> dict | None:
+        db = self._db_or_raise()
+        sets: list[str] = []
+        args: list = []
+        if name is not None:
+            sets.append("name = ?")
+            args.append(name)
+        if description is not None:
+            sets.append("description = ?")
+            args.append(description)
+        if kind is not None:
+            sets.append("kind = ?")
+            args.append(kind)
+        if sets:
+            args.append(kb_id)
+            await db.execute(f"UPDATE workspace SET {', '.join(sets)} WHERE id = ?", tuple(args))
+            await db.commit()
+        cursor = await db.execute(
+            "SELECT id, name, name as slug, description, kind FROM workspace WHERE id = ?", (kb_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return _rows_to_dicts(cursor, [row])[0]
+
 
     async def get_document(self, kb_id: str, filename: str, dir_path: str) -> dict | None:
         db = self._db_or_raise()
         cursor = await db.execute(
             "SELECT id, user_id, filename, title, path, content, tags, version, "
-            "file_type, page_count, created_at, updated_at "
+            "file_type, page_count, highlights, metadata, date, created_at, updated_at "
             "FROM documents WHERE filename = ? AND path = ? AND status != 'failed'",
             (filename, dir_path),
         )
@@ -192,7 +257,30 @@ class SqliteVaultFS(VaultFS):
         name_lower = name.lower()
         cursor = await db.execute(
             "SELECT id, user_id, filename, title, path, content, tags, version, "
-            "file_type, page_count, created_at, updated_at "
+            "file_type, page_count, highlights, metadata, date, created_at, updated_at "
+            "FROM documents WHERE (lower(filename) = ? OR lower(title) = ?) AND status != 'failed'",
+            (name_lower, name_lower),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        return rows[0] if rows else None
+
+    async def get_document_metadata(self, kb_id: str, filename: str, dir_path: str) -> dict | None:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, user_id, filename, title, path, tags, version, file_type, "
+            "page_count, highlights, metadata, date, created_at, updated_at "
+            "FROM documents WHERE filename = ? AND path = ? AND status != 'failed'",
+            (filename, dir_path),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        return rows[0] if rows else None
+
+    async def find_document_metadata_by_name(self, kb_id: str, name: str) -> dict | None:
+        db = self._db_or_raise()
+        name_lower = name.lower()
+        cursor = await db.execute(
+            "SELECT id, user_id, filename, title, path, tags, version, file_type, "
+            "page_count, highlights, metadata, date, created_at, updated_at "
             "FROM documents WHERE (lower(filename) = ? OR lower(title) = ?) AND status != 'failed'",
             (name_lower, name_lower),
         )
@@ -209,21 +297,36 @@ class SqliteVaultFS(VaultFS):
         row = await cursor.fetchone()
         doc_number = row[0]
 
-        await db.execute(
-            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
-            "file_type, status, content, tags, date, metadata, version, document_number) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 0, ?)",
-            (doc_id, self.user_id, filename, title, dir_path, relative_path, source_kind,
-             file_type, content, json.dumps(tags), date,
-             json.dumps(metadata) if metadata else None, doc_number),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+                "file_type, file_size, status, content, tags, date, metadata, version, document_number) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ready', ?, ?, ?, ?, 1, ?)",
+                (doc_id, self.user_id, filename, title, dir_path, relative_path, source_kind,
+                 file_type, len(content.encode("utf-8")), content, json.dumps(tags), date,
+                 json.dumps(metadata) if metadata else None, doc_number),
+            )
+            if file_type in ("md", "txt"):
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+            await db.commit()
+        except aiosqlite.IntegrityError as e:
+            await db.rollback()
+            raise DuplicateDocumentError(dir_path, filename) from e
+        except Exception:
+            await db.rollback()
+            raise
         return {"id": doc_id, "filename": filename, "path": dir_path}
 
     async def update_document(self, doc_id: str, content: str, tags: list[str] | None = None, title: str | None = None, date: str | None = None, metadata: dict | None = None) -> dict | None:
         db = self._db_or_raise()
-        sets = ["content = ?", "version = version + 1", "updated_at = datetime('now')"]
-        args: list = [content]
+        sets = [
+            "content = ?",
+            "file_size = ?",
+            "version = COALESCE(version, 0) + 1",
+            "updated_at = datetime('now')",
+            "stale_since = NULL",
+        ]
+        args: list = [content, len(content.encode("utf-8"))]
 
         if title is not None:
             sets.append("title = ?")
@@ -235,16 +338,52 @@ class SqliteVaultFS(VaultFS):
             sets.append("date = ?")
             args.append(date)
         if metadata is not None:
-            sets.append("metadata = ?")
+            sets.append("metadata = json_patch(json_remove(COALESCE(metadata, '{}'), '$.description'), ?)")
             args.append(json.dumps(metadata))
 
         args.append(doc_id)
-        await db.execute(
-            f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",
-            tuple(args),
-        )
-        await db.commit()
-        return None
+        try:
+            await db.execute(
+                f"UPDATE documents SET {', '.join(sets)} WHERE id = ?",
+                tuple(args),
+            )
+
+            cursor = await db.execute(
+                "SELECT filename, path, file_type FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if row and row[2] in ("md", "txt"):
+                await store_chunks_sqlite(db, doc_id, chunk_text(content or ""))
+
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return {"id": doc_id, "filename": row[0], "path": row[1]} if row else None
+
+    async def add_highlight_reply(self, doc_id: str, highlight_id: str, reply: dict) -> dict | None:
+        db = self._db_or_raise()
+        cursor = await db.execute("SELECT highlights FROM documents WHERE id = ?", (doc_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        highlights = parse_highlights_value(row[0])
+        target = find_highlight(highlights, highlight_id)
+        if target is None:
+            return None
+        append_reply(target, reply)
+        try:
+            await db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = COALESCE(version, 0) + 1, updated_at = datetime('now') "
+                "WHERE id = ?",
+                (json.dumps(highlights), doc_id),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        return target
 
     async def archive_documents(self, doc_ids: list[str]) -> int:
         db = self._db_or_raise()
@@ -259,18 +398,50 @@ class SqliteVaultFS(VaultFS):
     async def list_documents(self, kb_id: str) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
-            "SELECT id, filename, title, path, file_type, tags, page_count, updated_at "
-            "FROM documents WHERE status != 'failed' ORDER BY path, filename",
+            "SELECT id, filename, title, path, file_type, tags, page_count, date, updated_at "
+            "FROM documents WHERE status != 'failed' "
+            "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
+            "ORDER BY path, filename",
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
-    async def list_documents_with_content(self, kb_id: str) -> list[dict]:
+    async def list_documents_with_content(
+        self,
+        kb_id: str,
+        path_glob: str | None = None,
+        content_limit: int | None = None,
+        wiki_content_only: bool = False,
+    ) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
-            "SELECT id, filename, title, path, content, tags, file_type, page_count "
-            "FROM documents WHERE status != 'failed' ORDER BY path, filename",
+            "SELECT id, filename, title, path, content, tags, file_type, page_count, highlights, metadata, date "
+            "FROM documents WHERE status != 'failed' "
+            "AND COALESCE(json_extract(metadata, '$.asset'), 0) != 1 "
+            "AND (? IS NULL OR (path || filename) GLOB ?) "
+            "ORDER BY path, filename",
+            (path_glob, path_glob),
         )
-        return _rows_to_dicts(cursor, await cursor.fetchall())
+        docs = _rows_to_dicts(cursor, await cursor.fetchall())
+        chars_left = content_limit
+        batch_text_types = {"md", "txt", "csv", "html", "svg", "json", "xml"}
+        for doc in docs:
+            allowed = (
+                (not wiki_content_only or doc["path"].startswith("/wiki/"))
+                and (content_limit is None or doc.get("file_type") in batch_text_types)
+            )
+            content = doc.get("content") or ""
+            if not allowed:
+                doc["content"] = None
+                doc["content_truncated"] = False
+                continue
+            if chars_left is None:
+                doc["content_truncated"] = False
+                continue
+            take = max(0, min(len(content), chars_left))
+            doc["content"] = content[:take] if take else None
+            doc["content_truncated"] = take < len(content)
+            chars_left -= take
+        return docs
 
 
     async def get_pages(self, doc_id: str, page_nums: list[int]) -> list[dict]:
@@ -293,55 +464,98 @@ class SqliteVaultFS(VaultFS):
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
+    async def get_pages_for_batch(self, doc_id: str, max_chars: int) -> list[dict]:
+        if max_chars <= 0:
+            return []
+        rows = await self.get_all_pages(doc_id)
+        result: list[dict] = []
+        chars_left = max_chars
+        for row in rows:
+            content = row.get("content") or ""
+            take = max(0, min(len(content), chars_left))
+            if take <= 0:
+                break
+            item = dict(row)
+            item["content"] = content[:take]
+            item["content_truncated"] = take < len(content)
+            result.append(item)
+            chars_left -= take + 32
+        return result
 
-    async def search_chunks(self, kb_id: str, query: str, limit: int, path_filter: str | None = None) -> list[dict]:
+    async def get_page_index(self, doc_id: str) -> list[dict]:
         db = self._db_or_raise()
-        fetch_limit = limit * 3
-
-        try:
-            fts_results = await self._search_fts(db, query, fetch_limit, path_filter)
-        except Exception:
-            logger.warning("FTS5 search failed for query: %s", query, exc_info=True)
-            fts_results = []
-
-        try:
-            vec_results = await self._search_vec(db, query, fetch_limit, path_filter)
-        except Exception:
-            logger.debug("Vector search unavailable", exc_info=True)
-            vec_results = []
-
-        if not vec_results:
-            return fts_results[:limit]
-        if not fts_results:
-            return vec_results[:limit]
-        return _rrf_combine(fts_results, vec_results, limit)
-
-    async def _search_fts(self, db, query: str, limit: int, path_filter: str | None) -> list[dict]:
-        sql = (
-            "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
-            "d.filename, d.title, d.path, d.file_type, d.tags, "
-            "rank as score "
-            "FROM document_chunks dc "
-            "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
-            "JOIN documents d ON dc.document_id = d.id "
-            "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+        cursor = await db.execute(
+            "SELECT page, elements, "
+            "CASE WHEN content = '' THEN 0 ELSE length(content) - length(replace(content, char(10), '')) + 1 END AS row_count "
+            "FROM document_pages WHERE document_id = ? ORDER BY page",
+            (doc_id,),
         )
-        params: list = [query]
-        if path_filter == "wiki":
-            sql += "AND d.source_kind = 'wiki' "
-        elif path_filter == "sources":
-            sql += "AND d.source_kind != 'wiki' "
-        sql += "ORDER BY rank LIMIT ?"
-        params.append(limit)
-        cursor = await db.execute(sql, params)
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
-    async def _search_vec(self, db, query: str, limit: int, path_filter: str | None) -> list[dict]:
-        from embedder import embed_query, serialize_embedding
-        query_emb = serialize_embedding(embed_query(query))
 
+    async def search_chunks(
+        self, kb_id: str, query: str, limit: int,
+        path_filter: str | None = None,
+        annotated_only: bool = False,
+        scope: str = "all",
+    ) -> list[dict]:
+        """Hybrid search (fork): FTS5 keywords + sqlite-vec similarity, fused with RRF.
+
+        Either signal may fail or be empty (no embeddings yet, model unavailable);
+        search then degrades to whichever one works.
+        """
+        fts_query = _fts5_keywords(query)
+        if not fts_query:
+            return []
+        # chunks_fts indexes only `content`, so scope filters run in Python; over-fetch 3x so
+        # narrow scopes still fill `limit` and fusion has depth to work with.
+        sql_limit = limit * 3
+        try:
+            fts_rows = await self._select_chunk_matches(fts_query, path_filter, annotated_only, sql_limit)
+        except Exception:
+            logger.warning("FTS5 search failed for query: %s", query, exc_info=True)
+            fts_rows = []
+        vec_rows: list[dict] = []
+        if scope != "annotations":  # vectors embed source text, not annotations
+            try:
+                vec_rows = await self._select_vector_matches(query, path_filter, annotated_only, sql_limit)
+            except Exception:
+                logger.debug("Vector search unavailable", exc_info=True)
+        rows = _rrf_combine(fts_rows, vec_rows) if vec_rows else fts_rows
+
+        q_lower = query.lower()
+        labeled: list[dict] = []
+        for r in rows:
+            semantic = r.pop("_from_vec", False)
+            src = (r.get("source_content") or "").lower()
+            ann = (r.get("annotations_text") or "").lower()
+            source_hit = q_lower in src
+            annotation_hit = bool(ann) and q_lower in ann
+            if scope == "annotations" and not annotation_hit:
+                continue
+            if scope == "source" and not (source_hit or semantic):
+                continue
+            r["source_hit"] = source_hit
+            r["annotation_hit"] = annotation_hit
+            labeled.append(r)
+            if len(labeled) >= limit:
+                break
+        return labeled
+
+    async def _select_vector_matches(
+        self, query: str, path_filter: str | None, annotated_only: bool, limit: int,
+    ) -> list[dict]:
+        from embedder import embed_query, serialize_embedding
+
+        db = self._db_or_raise()
+        # Nothing embedded yet → don't load the model just to match nothing.
+        cursor = await db.execute("SELECT 1 FROM chunk_vec LIMIT 1")
+        if await cursor.fetchone() is None:
+            return []
+        query_emb = serialize_embedding(await asyncio.to_thread(embed_query, query))
         sql = (
-            "SELECT dc.content, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "SELECT dc.content, dc.source_content, dc.annotations_text, "
+            "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
             "d.filename, d.title, d.path, d.file_type, d.tags, "
             "sub.distance as score "
             "FROM (SELECT chunk_id, distance FROM chunk_vec "
@@ -351,12 +565,13 @@ class SqliteVaultFS(VaultFS):
             "WHERE d.status != 'failed' "
         )
         params: list = [query_emb, limit]
+        if annotated_only:
+            sql += "AND dc.has_highlight = 1 "
         if path_filter == "wiki":
             sql += "AND d.source_kind = 'wiki' "
         elif path_filter == "sources":
             sql += "AND d.source_kind != 'wiki' "
         sql += "ORDER BY sub.distance"
-
         cursor = await db.execute(sql, params)
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
@@ -365,8 +580,16 @@ class SqliteVaultFS(VaultFS):
         relative = doc.get("relative_path") or (doc["path"].rstrip("/") + "/" + doc["filename"]).lstrip("/")
         return self._load_local_bytes(relative)
 
-    async def load_image_bytes(self, doc_id: str, image_id: str) -> bytes | None:
-        return None
+    async def load_asset_bytes(self, asset_doc_id: str) -> bytes | None:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT id, filename, path, file_type, relative_path FROM documents WHERE id = ? AND status != 'failed'",
+            (asset_doc_id,),
+        )
+        rows = _rows_to_dicts(cursor, await cursor.fetchall())
+        if not rows:
+            return None
+        return await self.load_source_bytes(rows[0])
 
     def _load_local_bytes(self, key: str) -> bytes | None:
         if _workspace_root is None:
@@ -380,12 +603,17 @@ class SqliteVaultFS(VaultFS):
         return None
 
 
-    def write_to_disk(self, dir_path: str, filename: str, content: str) -> bool:
-        file_path = self._resolve_path(dir_path.lstrip("/") + filename)
+    def write_to_disk(self, dir_path: str, filename: str, content: str, *, exclusive: bool = False) -> bool:
+        """Write a document's file; exclusive refuses to replace anything already on disk (raises FileExistsError)."""
+        relative = dir_path.lstrip("/") + filename
+        if any(part.startswith(".") for part in relative.split("/")):
+            return False
+        file_path = self._resolve_path(relative)
         if not file_path:
             return False
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        with file_path.open("x" if exclusive else "w", encoding="utf-8") as f:
+            f.write(content)
         return True
 
     def delete_from_disk(self, docs: list[dict]) -> None:
@@ -403,24 +631,34 @@ class SqliteVaultFS(VaultFS):
             return None
         return resolved
 
+    def _disk_file_exists(self, dir_path: str, filename: str) -> bool:
+        path = self._resolve_path(dir_path.lstrip("/") + filename)
+        return path is not None and path.exists()
 
-    async def delete_references(self, source_doc_id: str) -> None:
-        db = self._db_or_raise()
-        await db.execute("DELETE FROM document_references WHERE source_document_id = ?", (source_doc_id,))
-        await db.commit()
 
-    async def upsert_reference(self, source_id: str, target_id: str, kb_id: str, ref_type: str, page: int | None) -> None:
+    async def replace_references(
+        self,
+        source_id: str,
+        kb_id: str,
+        edges: list[tuple[str, str, int | None]],
+    ) -> None:
         db = self._db_or_raise()
         try:
             await db.execute(
-                "INSERT OR REPLACE INTO document_references "
-                "(source_document_id, target_document_id, reference_type, page) "
-                "VALUES (?, ?, ?, ?)",
-                (source_id, target_id, ref_type, page),
+                "DELETE FROM document_references WHERE source_document_id = ?",
+                (source_id,),
             )
+            if edges:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO document_references "
+                    "(source_document_id, target_document_id, reference_type, page) "
+                    "VALUES (?, ?, ?, ?)",
+                    [(source_id, target_id, ref_type, page) for target_id, ref_type, page in edges],
+                )
             await db.commit()
-        except Exception as e:
-            logger.warning("Failed to insert reference %s -> %s: %s", source_id[:8], target_id[:8], e)
+        except Exception:
+            await db.rollback()
+            raise
 
     async def propagate_staleness(self, doc_id: str) -> None:
         db = self._db_or_raise()
@@ -449,12 +687,23 @@ class SqliteVaultFS(VaultFS):
     async def get_forward_references(self, doc_id: str) -> list[dict]:
         db = self._db_or_raise()
         cursor = await db.execute(
-            "SELECT d.filename, d.title, d.path, dr.reference_type, dr.page "
+            "SELECT d.id, d.filename, d.title, d.path, dr.reference_type, dr.page "
             "FROM document_references dr "
             "JOIN documents d ON dr.target_document_id = d.id "
             "WHERE dr.source_document_id = ? AND d.status != 'failed' "
             "ORDER BY dr.reference_type, d.path, d.filename",
             (doc_id,),
+        )
+        return _rows_to_dicts(cursor, await cursor.fetchall())
+
+    async def get_reference_edges(self, kb_id: str) -> list[dict]:
+        db = self._db_or_raise()
+        cursor = await db.execute(
+            "SELECT dr.source_document_id AS source_id, dr.target_document_id AS target_id, "
+            "       dr.reference_type, dr.page "
+            "FROM document_references dr "
+            "JOIN documents source ON source.id = dr.source_document_id "
+            "WHERE source.status != 'failed'"
         )
         return _rows_to_dicts(cursor, await cursor.fetchall())
 
@@ -481,7 +730,6 @@ class SqliteVaultFS(VaultFS):
 
 
     async def get_workspace(self) -> dict | None:
-        """Get the workspace record, if it exists."""
         return await self.resolve_kb("")
 
     async def ensure_workspace(self, workspace_name: str) -> str:
@@ -498,3 +746,41 @@ class SqliteVaultFS(VaultFS):
         )
         await db.commit()
         return ws_id
+
+    async def _scaffold_wiki(self, kb_id: str, name: str) -> None:
+        today = date.today().isoformat()
+        overview = _OVERVIEW_TEMPLATE.format(name=name, date=today)
+        # Never overwrite existing local content — a rebuilt index could scaffold over real files.
+        if not self._disk_file_exists("/wiki/", "overview.md"):
+            await self.create_document(
+                kb_id, "overview.md", "Overview", "/wiki/", "md", overview,
+                ["overview", "wiki"], date=today,
+                metadata={"description": f"Research hub for {name}."},
+            )
+            self.write_to_disk("/wiki/", "overview.md", overview)
+
+    async def _select_chunk_matches(
+        self, fts_query: str, path_filter: str | None, annotated_only: bool, limit: int,
+    ) -> list[dict]:
+        db = self._db_or_raise()
+        sql = (
+            "SELECT dc.content, dc.source_content, dc.annotations_text, "
+            "dc.has_highlight, dc.page, dc.header_breadcrumb, dc.chunk_index, "
+            "d.filename, d.title, d.path, d.file_type, d.tags, "
+            "rank as score "
+            "FROM document_chunks dc "
+            "JOIN chunks_fts fts ON dc.rowid = fts.rowid "
+            "JOIN documents d ON dc.document_id = d.id "
+            "WHERE chunks_fts MATCH ? AND d.status != 'failed' "
+        )
+        params: list = [fts_query]
+        if annotated_only:
+            sql += "AND dc.has_highlight = 1 "
+        if path_filter == "wiki":
+            sql += "AND d.source_kind = 'wiki' "
+        elif path_filter == "sources":
+            sql += "AND d.source_kind != 'wiki' "
+        sql += "ORDER BY rank LIMIT ?"
+        params.append(limit)
+        cursor = await db.execute(sql, params)
+        return _rows_to_dicts(cursor, await cursor.fetchall())

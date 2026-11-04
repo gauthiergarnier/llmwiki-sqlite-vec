@@ -17,7 +17,10 @@ import {
   DropdownMenuItem, DropdownMenuSeparator, DropdownMenuSub,
   DropdownMenuSubTrigger, DropdownMenuSubContent,
 } from '@/components/ui/dropdown-menu'
+import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
+import { apiFetch } from '@/lib/api'
+import { useUserStore } from '@/stores'
 import { NoteEditor } from '@/components/editor/NoteEditor'
 import { NoteFormattingButtons } from '@/components/editor/NoteToolbar'
 import type { Editor } from '@tiptap/react'
@@ -26,10 +29,7 @@ import {
   UnsupportedViewer, ProcessingViewer, FailedViewer,
 } from '@/components/kb/DocViewers'
 import type { DocumentListItem } from '@/lib/types'
-
-/* ------------------------------------------------------------------ */
-/*  Types                                                              */
-/* ------------------------------------------------------------------ */
+import type { SelectionGesture } from '@/components/kb/kb-detail/useBulkSelection'
 
 type SortField = 'name' | 'date' | 'type'
 type SortDir = 'asc' | 'desc'
@@ -38,10 +38,6 @@ interface FolderNode {
   name: string
   path: string
 }
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
 
 function getChildFolders(docs: DocumentListItem[], currentPath: string): FolderNode[] {
   const folders = new Map<string, FolderNode>()
@@ -95,6 +91,27 @@ function isNoteFile(doc: DocumentListItem): boolean {
   return ft === 'md' || ft === 'txt' || ft === 'note'
 }
 
+function isWebClipDoc(doc: DocumentListItem): boolean {
+  const metadata = doc.metadata ?? {}
+  return (
+    metadata.clip_kind === 'web'
+    || metadata.source_url !== undefined
+    || ((doc.path || '').startsWith('/webclipper/') && doc.file_type === 'md')
+    || ['html', 'htm'].includes(doc.file_type)
+  )
+}
+
+function getSourceUrl(doc: DocumentListItem | null): string | null {
+  const value = doc?.metadata?.source_url
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : null
+  } catch {
+    return null
+  }
+}
+
 function docIcon(ft: string) {
   if (ft === 'pdf') return <FileText className="size-8 text-red-400/70" />
   if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ft)) return <Image className="size-8 text-violet-400/70" />
@@ -105,20 +122,6 @@ function docIcon(ft: string) {
   return <FileText className="size-8 text-muted-foreground/40" />
 }
 
-function docIconSmall(ft: string) {
-  if (ft === 'pdf') return <FileText className="size-3.5 text-red-400/70" />
-  if (['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(ft)) return <Image className="size-3.5 text-violet-400/70" />
-  if (['xlsx', 'xls', 'csv'].includes(ft)) return <Sheet className="size-3.5 text-emerald-500/70" />
-  if (['pptx', 'ppt', 'docx', 'doc'].includes(ft)) return <Presentation className="size-3.5 text-orange-400/70" />
-  if (['html', 'htm'].includes(ft)) return <FileCode className="size-3.5 text-sky-400/70" />
-  if (['md', 'txt'].includes(ft)) return <NotepadText className="size-3.5 text-muted-foreground/50" />
-  return <FileText className="size-3.5 text-muted-foreground/40" />
-}
-
-/* ------------------------------------------------------------------ */
-/*  FilesGrid — unified file browser + viewer                         */
-/* ------------------------------------------------------------------ */
-
 interface FilesGridProps {
   documents: DocumentListItem[]
   onDeleteDocument: (id: string) => void
@@ -128,17 +131,15 @@ interface FilesGridProps {
   onCreateFolder: (name: string, parentPath: string) => void
   onMoveDocument?: (docId: string, targetPath: string) => void
   onUploadFiles?: (files: File[], targetPath: string) => void
-  /** If set, open this doc on mount (e.g. from a citation click) */
   initialDocId?: string | null
   initialPage?: number
-  /** Initial folder path from URL */
   initialPath?: string
-  /** Notify parent when folder path changes (for URL sync) */
   onPathChange?: (path: string) => void
-  /** Notify parent when a doc is opened (for URL sync) */
   onDocOpen?: (docNumber: number | null) => void
-  /** Notify parent when a doc is closed (for URL sync) */
   onDocClose?: () => void
+  selectedIds: ReadonlySet<string>
+  onSelectDocument: (docId: string, gesture: SelectionGesture, visibleIds: readonly string[]) => void
+  onShownFolderChange: () => void
 }
 
 export function FilesGrid({
@@ -156,33 +157,33 @@ export function FilesGrid({
   onPathChange,
   onDocOpen,
   onDocClose,
+  selectedIds,
+  onSelectDocument,
+  onShownFolderChange,
 }: FilesGridProps) {
-  // Navigation state
   const [currentPath, setCurrentPath] = React.useState(initialPath ?? '/')
+  React.useEffect(() => onShownFolderChange(), [currentPath, onShownFolderChange])
   const [history, setHistory] = React.useState<string[]>([initialPath ?? '/'])
   const [historyIdx, setHistoryIdx] = React.useState(0)
 
-  // Active document (null = browsing grid)
   const [activeDocId, setActiveDocId] = React.useState<string | null>(initialDocId ?? null)
   const [docInitialPage, setDocInitialPage] = React.useState<number | undefined>(initialPage)
 
-  // Sync from route when browser back/forward changes initialPath
   React.useEffect(() => {
     const path = initialPath ?? '/'
-    if (path !== currentPath) {
-      setCurrentPath(path)
-      setHistory((prev) => {
-        const next = prev.slice(0, historyIdx + 1)
-        next.push(path)
-        return next
-      })
-      setHistoryIdx((prev) => prev + 1)
+    if (path === currentPath) return
+    setCurrentPath(path)
+    if (history[historyIdx - 1] === path) {
+      setHistoryIdx(historyIdx - 1)
+    } else if (history[historyIdx + 1] === path) {
+      setHistoryIdx(historyIdx + 1)
+    } else {
+      setHistory(history.slice(0, historyIdx + 1).concat(path))
+      setHistoryIdx(historyIdx + 1)
     }
-    // Only react to prop changes, not internal navigation
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialPath])
 
-  // Grid state
   const [sortField, setSortField] = React.useState<SortField>('name')
   const [sortDir, setSortDir] = React.useState<SortDir>('asc')
   const [searchQuery, setSearchQuery] = React.useState('')
@@ -191,18 +192,18 @@ export function FilesGrid({
   const [folderDialogOpen, setFolderDialogOpen] = React.useState(false)
   const [folderName, setFolderName] = React.useState('')
 
-  // Note editor instance (for rendering formatting buttons in the toolbar)
   const [noteEditor, setNoteEditor] = React.useState<Editor | null>(null)
-  // Editable note title (synced from NoteEditor, displayed in breadcrumb)
   const [noteTitle, setNoteTitle] = React.useState('')
-  // Ref to NoteEditor's title change handler (avoids unnecessary re-renders)
   const noteTitleChangeRef = React.useRef<((title: string) => void) | null>(null)
-  // Reset editor when switching docs
   React.useEffect(() => { setNoteEditor(null); setNoteTitle('') }, [activeDocId])
 
-  // Source docs only (exclude wiki)
   const sourceDocs = React.useMemo(
-    () => documents.filter((d) => !d.path.startsWith('/wiki/') && !d.archived),
+    () => documents.filter((d) => (
+      !d.path.startsWith('/wiki/') &&
+      !d.archived &&
+      d.metadata?.hidden !== true &&
+      d.metadata?.asset !== true
+    )),
     [documents],
   )
 
@@ -213,10 +214,8 @@ export function FilesGrid({
 
   const isBrowsing = !activeDoc
 
-  // Sync note title when activeDoc changes
   React.useEffect(() => { if (activeDoc) setNoteTitle(activeDoc.title || activeDoc.filename) }, [activeDoc])
 
-  // Navigation
   const navigateTo = React.useCallback((path: string) => {
     setActiveDocId(null)
     setDocInitialPage(undefined)
@@ -236,6 +235,15 @@ export function FilesGrid({
     onDocOpen?.(doc.document_number)
   }, [onDocOpen])
 
+  const downloadDoc = React.useCallback(async (docId: string) => {
+    try {
+      const { url } = await apiFetch<{ url: string }>(`/v1/documents/${docId}/url`, useUserStore.getState().accessToken ?? '')
+      window.open(url, '_blank', 'noopener,noreferrer')
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Download failed')
+    }
+  }, [])
+
   const closeDoc = React.useCallback(() => {
     setActiveDocId(null)
     setDocInitialPage(undefined)
@@ -251,21 +259,14 @@ export function FilesGrid({
       return
     }
     if (historyIdx <= 0) return
-    const newIdx = historyIdx - 1
-    setHistoryIdx(newIdx)
-    setCurrentPath(history[newIdx])
-    onPathChange?.(history[newIdx])
-  }, [isBrowsing, closeDoc, historyIdx, history, onPathChange])
+    window.history.back()
+  }, [isBrowsing, closeDoc, historyIdx])
 
   const goForward = React.useCallback(() => {
     if (!isBrowsing || !canGoForward) return
-    const newIdx = historyIdx + 1
-    setHistoryIdx(newIdx)
-    setCurrentPath(history[newIdx])
-    onPathChange?.(history[newIdx])
-  }, [isBrowsing, canGoForward, historyIdx, history, onPathChange])
+    window.history.forward()
+  }, [isBrowsing, canGoForward])
 
-  // Grid data
   const folders = React.useMemo(() => getChildFolders(sourceDocs, currentPath), [sourceDocs, currentPath])
   const docsInFolder = React.useMemo(() => sortDocs(getDocsInFolder(sourceDocs, currentPath), sortField, sortDir), [sourceDocs, currentPath, sortField, sortDir])
 
@@ -281,9 +282,12 @@ export function FilesGrid({
     return docsInFolder.filter((d) => (d.title || d.filename).toLowerCase().includes(q) || d.file_type.toLowerCase().includes(q))
   }, [docsInFolder, searchQuery])
 
-  const isActiveNote = activeDoc ? isNoteFile(activeDoc) : false
+  const visibleDocIds = React.useMemo(() => filteredDocs.map((d) => d.id), [filteredDocs])
 
-  // Breadcrumbs — adapt to browsing vs viewing
+  const isActiveWebClip = activeDoc ? isWebClipDoc(activeDoc) : false
+  const isActiveNote = activeDoc ? isNoteFile(activeDoc) && !isActiveWebClip : false
+  const activeSourceUrl = getSourceUrl(activeDoc)
+
   const breadcrumbs = React.useMemo(() => {
     const crumbs = parseBreadcrumbs(activeDoc ? (activeDoc.path || '/') : currentPath)
     if (activeDoc) {
@@ -295,7 +299,6 @@ export function FilesGrid({
     return crumbs
   }, [currentPath, activeDoc, isActiveNote])
 
-  // Bind creation actions to current path
   const handleUploadHere = React.useCallback(() => onUpload(currentPath), [onUpload, currentPath])
   const handleCreateNoteHere = React.useCallback(() => onCreateNote(currentPath), [onCreateNote, currentPath])
 
@@ -313,12 +316,10 @@ export function FilesGrid({
     }
   }, [searchOpen])
 
-  // Drag-and-drop state
   const [gridDragOver, setGridDragOver] = React.useState(false)
   const gridDragCounter = React.useRef(0)
 
   const handleGridDragEnter = (e: React.DragEvent) => {
-    // Ignore internal item drags (handled by folder cards)
     if (e.dataTransfer.types.includes('application/x-llmwiki-item')) return
     e.preventDefault()
     gridDragCounter.current++
@@ -362,7 +363,6 @@ export function FilesGrid({
       onDragOver={handleGridDragOver}
       onDrop={handleGridDrop}
     >
-      {/* OS file drop overlay */}
       {gridDragOver && (
         <div className="absolute inset-0 z-40 bg-background/80 backdrop-blur-sm flex items-center justify-center pointer-events-none">
           <div className="flex flex-col items-center gap-3 border-2 border-dashed border-primary rounded-xl px-12 py-10">
@@ -373,9 +373,7 @@ export function FilesGrid({
         </div>
       )}
 
-      {/* ── Toolbar (always mounted, never flashes) ── */}
       <div className="shrink-0 flex items-center gap-1.5 px-4 h-10 border-b border-border">
-        {/* Back / Forward */}
         <button
           onClick={goBack}
           disabled={!canGoBack}
@@ -397,7 +395,6 @@ export function FilesGrid({
           <ChevronRight className="size-4" />
         </button>
 
-        {/* Breadcrumbs */}
         <nav className="flex items-center gap-1 text-sm min-w-0 mr-auto overflow-hidden ml-1">
           {breadcrumbs.map((seg, i) => {
             const isLast = i === breadcrumbs.length - 1
@@ -437,10 +434,8 @@ export function FilesGrid({
           })}
         </nav>
 
-        {/* Right side — grid controls when browsing, file info when viewing */}
         {isBrowsing ? (
           <>
-            {/* Search */}
             <div className={cn(
               'relative flex items-center rounded-md transition-all duration-200 ease-in-out overflow-hidden',
               searchOpen ? 'w-48 bg-muted/50 border border-border' : 'w-7'
@@ -529,18 +524,39 @@ export function FilesGrid({
         ) : activeDoc && isActiveNote ? (
           <>
             <NoteFormattingButtons editor={noteEditor} />
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
+            <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
+              <X className="size-3.5" />
+            </button>
+          </>
+        ) : activeDoc && isActiveWebClip ? (
+          <>
+            {activeSourceUrl && (
+              <button
+                onClick={() => window.open(activeSourceUrl, '_blank', 'noopener,noreferrer')}
+                className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer"
+                title="Open source URL"
+              >
+                <ExternalLink className="size-3.5" />
+              </button>
+            )}
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
               <X className="size-3.5" />
             </button>
           </>
         ) : activeDoc ? (
           <>
-            <button onClick={() => { /* TODO: trigger search in PDF viewer */ }} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Find in document">
-              <Search className="size-3.5" />
-            </button>
-            <a href={`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/v1/documents/${activeDoc.id}/download`} download className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Download">
+            <button onClick={() => downloadDoc(activeDoc.id)} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Download" aria-label="Download">
               <Download className="size-3.5" />
-            </a>
+            </button>
             <button onClick={closeDoc} className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-accent rounded-md transition-colors cursor-pointer" title="Close">
               <X className="size-3.5" />
             </button>
@@ -548,11 +564,11 @@ export function FilesGrid({
         ) : null}
       </div>
 
-      {/* ── Content area ── */}
       <div className="flex-1 min-h-0">
         {activeDoc ? (
-          /* ── Document viewer ── */
-          isNoteFile(activeDoc) ? (
+          isWebClipDoc(activeDoc) ? (
+            <HtmlDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
+          ) : isNoteFile(activeDoc) ? (
             <NoteEditor
               key={activeDoc.id}
               documentId={activeDoc.id}
@@ -573,15 +589,12 @@ export function FilesGrid({
             <PdfDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} initialPage={docInitialPage} hideToolbar />
           ) : ['png', 'jpg', 'jpeg', 'webp', 'gif', 'svg'].includes(activeDoc.file_type) ? (
             <ImageViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
-          ) : ['html', 'htm'].includes(activeDoc.file_type) ? (
-            <HtmlDocViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} />
           ) : ['xlsx', 'xls', 'csv'].includes(activeDoc.file_type) ? (
             <ContentViewer documentId={activeDoc.id} title={activeDoc.title || activeDoc.filename} fileType={activeDoc.file_type} />
           ) : (
             <UnsupportedViewer title={activeDoc.title || activeDoc.filename} />
           )
         ) : (
-          /* ── File grid ── */
           <ContextMenu>
             <ContextMenuTrigger asChild>
               <div className="h-full overflow-y-auto p-4">
@@ -607,7 +620,14 @@ export function FilesGrid({
                         ))}
                         {filteredDocs.map((doc) => (
                           <motion.div key={doc.id} layout exit={{ opacity: 0, scale: 0.95 }} transition={{ layout: { duration: 0.15, ease: 'easeOut' }, opacity: { duration: 0.1 } }} className="h-full">
-                            <DocumentCard doc={doc} onOpen={() => openDoc(doc)} onDelete={() => onDeleteDocument(doc.id)} onRename={(t) => onRenameDocument(doc.id, t)} />
+                            <DocumentCard
+                              doc={doc}
+                              isSelected={selectedIds.has(doc.id)}
+                              onOpen={() => openDoc(doc)}
+                              onSelect={(gesture) => onSelectDocument(doc.id, gesture, visibleDocIds)}
+                              onDelete={() => onDeleteDocument(doc.id)}
+                              onRename={(t) => onRenameDocument(doc.id, t)}
+                            />
                           </motion.div>
                         ))}
                       </AnimatePresence>
@@ -617,16 +637,15 @@ export function FilesGrid({
               </div>
             </ContextMenuTrigger>
             <ContextMenuContent>
-              <ContextMenuItem onClick={handleCreateNoteHere}><NotepadText className="size-3.5 mr-2" />New Note</ContextMenuItem>
-              <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />New Folder</ContextMenuItem>
+              <ContextMenuItem onClick={handleCreateNoteHere}><NotepadText className="size-3.5 mr-2" />New note</ContextMenuItem>
+              <ContextMenuItem onClick={() => setFolderDialogOpen(true)}><FolderPlus className="size-3.5 mr-2" />New folder</ContextMenuItem>
               <ContextMenuSeparator />
-              <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />Upload Files</ContextMenuItem>
+              <ContextMenuItem onClick={handleUploadHere}><Upload className="size-3.5 mr-2" />Upload files</ContextMenuItem>
             </ContextMenuContent>
           </ContextMenu>
         )}
       </div>
 
-      {/* New folder dialog */}
       {folderDialogOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setFolderDialogOpen(false)}>
           <div className="bg-background border border-border rounded-lg p-6 w-80 shadow-xl" onClick={(e) => e.stopPropagation()}>
@@ -642,10 +661,6 @@ export function FilesGrid({
     </div>
   )
 }
-
-/* ------------------------------------------------------------------ */
-/*  Cards                                                              */
-/* ------------------------------------------------------------------ */
 
 function FolderCard({ name, path, onNavigate, onDropDocuments, onDropFiles }: {
   name: string
@@ -699,7 +714,20 @@ function FolderCard({ name, path, onNavigate, onDropDocuments, onDropFiles }: {
   )
 }
 
-function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListItem; onOpen: () => void; onDelete: () => void; onRename: (t: string) => void }) {
+function selectionGestureFor(e: React.MouseEvent): SelectionGesture | null {
+  if (e.metaKey || e.ctrlKey) return 'toggle'
+  if (e.shiftKey) return 'range'
+  return null
+}
+
+function DocumentCard({ doc, isSelected, onOpen, onSelect, onDelete, onRename }: {
+  doc: DocumentListItem
+  isSelected: boolean
+  onOpen: () => void
+  onSelect: (gesture: SelectionGesture) => void
+  onDelete: () => void
+  onRename: (t: string) => void
+}) {
   const [renaming, setRenaming] = React.useState(false)
   const [renameValue, setRenameValue] = React.useState('')
   const [dragging, setDragging] = React.useState(false)
@@ -727,6 +755,12 @@ function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListIt
 
   const handleDragEnd = () => setDragging(false)
 
+  const handleClick = (e: React.MouseEvent) => {
+    const gesture = selectionGestureFor(e)
+    if (gesture) onSelect(gesture)
+    else onOpen()
+  }
+
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
@@ -734,9 +768,11 @@ function DocumentCard({ doc, onOpen, onDelete, onRename }: { doc: DocumentListIt
           draggable={!renaming}
           onDragStart={handleDragStart}
           onDragEnd={handleDragEnd}
-          onClick={onOpen}
+          onClick={handleClick}
+          aria-selected={isSelected}
           className={cn(
-            'group relative rounded-lg border border-border hover:bg-accent/40 cursor-pointer transition-colors flex flex-col overflow-hidden h-full',
+            'group relative rounded-lg border cursor-pointer select-none transition-colors flex flex-col overflow-hidden h-full',
+            isSelected ? 'border-primary/50 bg-accent ring-1 ring-primary/30' : 'border-border hover:bg-accent/40',
             dragging && 'opacity-40',
           )}
         >
@@ -785,7 +821,7 @@ function NewCard({ onCreateNote, onUpload, onCreateFolder }: { onCreateNote: () 
         <DropdownMenuItem onClick={onCreateNote}><NotepadText className="size-3.5 mr-2" />Note</DropdownMenuItem>
         <DropdownMenuItem onClick={onCreateFolder}><FolderPlus className="size-3.5 mr-2" />Folder</DropdownMenuItem>
         <DropdownMenuSeparator />
-        <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />Upload Files</DropdownMenuItem>
+        <DropdownMenuItem onClick={onUpload}><Upload className="size-3.5 mr-2" />Upload files</DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )

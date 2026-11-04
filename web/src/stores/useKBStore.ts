@@ -3,14 +3,19 @@ import { apiFetch } from '@/lib/api'
 import { useUserStore } from './useUserStore'
 import type { KnowledgeBase } from '@/lib/types'
 
+type FetchKBsOptions = {
+  throwOnError?: boolean
+}
+
 type KBState = {
   knowledgeBases: KnowledgeBase[]
   loading: boolean
   error: string | null
-  fetchKBs: () => Promise<KnowledgeBase[]>
-  createKB: (name: string, description?: string) => Promise<KnowledgeBase>
+  fetchKBs: (options?: FetchKBsOptions) => Promise<KnowledgeBase[]>
+  createKB: (name: string, description?: string, kind?: 'wiki' | 'course') => Promise<KnowledgeBase>
   deleteKB: (id: string) => Promise<void>
   renameKB: (id: string, name: string) => Promise<void>
+  setKBKind: (id: string, kind: 'wiki' | 'course') => Promise<void>
 }
 
 function getToken(): string {
@@ -24,26 +29,28 @@ export const useKBStore = create<KBState>((set, get) => ({
   loading: true,
   error: null,
 
-  fetchKBs: async () => {
-    set({ loading: true, error: null })
+  fetchKBs: async (options) => {
+    const hadData = get().knowledgeBases.length > 0
+    set({ loading: !hadData, error: null })
     try {
       const token = getToken()
       const data = await apiFetch<KnowledgeBase[]>('/v1/knowledge-bases', token)
       set({ knowledgeBases: data, loading: false })
       return data
     } catch (err) {
-      set({ error: (err as Error).message, loading: false })
-      return []
+      set({ error: hadData ? null : (err as Error).message, loading: false })
+      if (options?.throwOnError) throw err
+      return hadData ? get().knowledgeBases : []
     }
   },
 
-  createKB: async (name: string, description?: string) => {
+  createKB: async (name: string, description?: string, kind?: 'wiki' | 'course') => {
     const token = getToken()
     const kb = await apiFetch<KnowledgeBase>('/v1/knowledge-bases', token, {
       method: 'POST',
-      body: JSON.stringify({ name, description: description || undefined }),
+      body: JSON.stringify({ name, description: description || undefined, kind: kind === 'course' ? kind : undefined }),
     })
-    // Dedupe: in local mode the backend returns the existing singleton
+    // Local mode returns the existing singleton KB.
     const existing = get().knowledgeBases
     if (existing.some((k) => k.id === kb.id)) {
       set({ knowledgeBases: existing.map((k) => k.id === kb.id ? kb : k) })
@@ -64,6 +71,17 @@ export const useKBStore = create<KBState>((set, get) => ({
     const updated = await apiFetch<KnowledgeBase>(`/v1/knowledge-bases/${id}`, token, {
       method: 'PATCH',
       body: JSON.stringify({ name }),
+    })
+    set({
+      knowledgeBases: get().knowledgeBases.map((kb) => (kb.id === id ? updated : kb)),
+    })
+  },
+
+  setKBKind: async (id: string, kind: 'wiki' | 'course') => {
+    const token = getToken()
+    const updated = await apiFetch<KnowledgeBase>(`/v1/knowledge-bases/${id}`, token, {
+      method: 'PATCH',
+      body: JSON.stringify({ kind }),
     })
     set({
       knowledgeBases: get().knowledgeBases.map((kb) => (kb.id === id ? updated : kb)),

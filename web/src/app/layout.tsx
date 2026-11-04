@@ -1,8 +1,8 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import { ThemeProvider } from "next-themes";
 import { Toaster } from "@/components/ui/sonner";
-import { OpenReplayTracker } from "@/components/OpenReplay";
+import { ServiceWorkerRegistration } from "@/components/pwa/ServiceWorkerRegistration";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -19,6 +19,25 @@ export const metadata: Metadata = {
   title: "LLM Wiki",
   description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
   metadataBase: new URL("https://llmwiki.app"),
+  manifest: "/manifest.webmanifest",
+  icons: {
+    icon: [
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/icon-192x192.png", sizes: "192x192", type: "image/png" },
+    ],
+    apple: [
+      {
+        url: "/apple-touch-icon.png",
+        sizes: "180x180",
+        type: "image/png",
+      },
+    ],
+  },
+  appleWebApp: {
+    capable: true,
+    title: "LLM Wiki",
+    statusBarStyle: "default",
+  },
   openGraph: {
     title: "LLM Wiki",
     description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
@@ -33,10 +52,23 @@ export const metadata: Metadata = {
     description: "Free, open-source implementation of Karpathy's LLM Wiki. Upload documents and build a compounding wiki directly via Claude.",
     images: ["/og.png"],
   },
+  // Tells the Chrome extension's content script to stand down on any wiki host.
+  other: {
+    "llmwiki-app": "true",
+  },
 };
 
-// Script to prevent theme flash - runs before React hydrates
-// Must match the storageKey used by ThemeProvider (default is 'theme')
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#f5f5f4" },
+    { media: "(prefers-color-scheme: dark)", color: "#0c0a09" },
+  ],
+};
+
+// Runs before hydration to prevent a theme flash; storageKey must match ThemeProvider's.
 const themeScript = `
   (function() {
     try {
@@ -85,7 +117,7 @@ export default function RootLayout({
         >
           {children}
           <Toaster richColors />
-          <OpenReplayTracker />
+          <ServiceWorkerRegistration />
         </ThemeProvider>
       </body>
     </html>

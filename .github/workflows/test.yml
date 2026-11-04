@@ -4,12 +4,23 @@ on:
   push:
     branches: [master]
   pull_request:
-    branches: [master]
+    branches: [master, dev]
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  lint:
+    name: Ruff
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/ruff-action@v3
+        with:
+          version: "0.12.3"
+
   unit:
     name: Unit tests (no DB)
     runs-on: ubuntu-latest
@@ -28,11 +39,59 @@ jobs:
           pip install -r tests/requirements.txt cryptography
 
       - name: Run API unit tests
-        run: PYTHONPATH=api pytest tests/unit/test_chunker.py tests/unit/test_helpers.py tests/unit/test_pdf_extract.py -v
+        run: >-
+          PYTHONPATH=api pytest
+          tests/unit/test_api_quiz_validation.py
+          tests/unit/test_chunker.py
+          tests/unit/test_helpers.py
+          tests/unit/test_pdf_extract.py
+          tests/unit/test_highlight_granular.py
+          tests/unit/test_html_parser_highlights.py
+          tests/unit/test_html_embed_images_ssrf.py
+          tests/unit/test_fork_references.py
+          tests/unit/test_fork_chunk_vectors.py
+          tests/unit/test_preserve_replies.py
+          tests/unit/test_auth_refresh_limits.py
+          tests/unit/test_auth_provider_invariant.py
+          tests/unit/test_deps_lifecycle.py
+          tests/unit/test_hosted_parser_isolation.py
+          tests/unit/test_local_http_boundary.py
+          tests/unit/test_local_events.py
+          tests/unit/test_local_processor_extraction.py
+          tests/unit/test_local_reconcile.py
+          tests/unit/test_local_upload_streaming.py
+          tests/unit/test_text_content_limits.py
+          tests/unit/test_upload_hardening.py
+          tests/unit/test_url_ingest.py
+          tests/unit/test_watcher_paths.py
+          tests/unit/test_quiz_grader.py
+          tests/unit/test_sqlite_local_schema.py
+          tests/unit/test_sqlite_write_lock.py
+          tests/unit/test_references.py
+          tests/unit/test_references_links.py
+          tests/unit/test_graph_local.py
+          tests/unit/test_highlight_chunks.py
+          tests/unit/test_highlight_sync_integration.py
+          tests/unit/test_highlight_types.py
+          tests/unit/test_persistence_batching.py
+          tests/unit/test_webclip_ssrf.py
+          tests/unit/test_guide_course_prompt.py
+          tests/unit/test_mcp_helpers.py
+          tests/unit/test_ocr_routing.py
+          tests/unit/test_local_file_serving.py
+          tests/unit/test_html_parser_tables.py
+          tests/unit/test_ts_parity.py
+          tests/unit/test_real_page_goldens.py
+          tests/unit/test_parser_invariants.py
+          tests/unit/test_html_parser_hardening.py
+          tests/unit/test_local_content_writes.py
+          tests/integration/test_converter_isolation.py
+          tests/integration/test_converter_service.py
+          -v
 
       - name: Run MCP unit tests
         working-directory: mcp
-        run: pytest ../tests/unit/mcp/ -v
+        run: pytest ../tests/unit/mcp/ ../tests/unit/test_mcp_delete_approval.py -v
 
   mcp-integration:
     name: MCP integration tests (SQLite)
@@ -53,7 +112,81 @@ jobs:
 
       - name: Run MCP VaultFS + tool handler tests
         working-directory: mcp
-        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py -v
+        run: pytest ../tests/integration/mcp/test_vaultfs_contract.py ../tests/integration/mcp/test_tool_handlers.py ../tests/integration/mcp/test_reply_tool.py ../tests/integration/mcp/test_comments_tool.py ../tests/integration/mcp/test_quiz_lint.py ../tests/integration/mcp/test_fork_hybrid_search.py -v
+
+  web:
+    name: Web tests (tsc + vitest)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: web
+        run: npm run check
+
+      - name: Run vitest
+        working-directory: web
+        run: npm test
+
+  extension:
+    name: Extension tests and package validation
+    runs-on: ubuntu-latest
+    env:
+      # CI validates packaging with intentionally non-production public config;
+      # it does not publish this archive. Release verification rejects these.
+      PACKAGE_VALIDATION_MODE: test
+      VITE_API_BASE_URL: https://api.llmwiki.app
+      VITE_SUPABASE_URL: https://ci-placeholder.supabase.co
+      VITE_SUPABASE_ANON_KEY: ci-placeholder-anon-key
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - name: Install dependencies
+        working-directory: extension
+        run: npm ci
+
+      # tsconfig extends ./.wxt/tsconfig.json, which only exists after prepare
+      - name: Generate WXT types
+        working-directory: extension
+        run: npx wxt prepare
+
+      - name: Typecheck
+        working-directory: extension
+        run: npm run check
+
+      - name: Run vitest
+        working-directory: extension
+        run: npm test
+
+      - name: Build extension
+        working-directory: extension
+        run: npm run build
+
+      - name: Create test package
+        working-directory: extension
+        run: npm run zip
+
+      - name: Validate release package
+        working-directory: extension
+        run: npm run verify:package
 
   postgres-integration:
     name: Integration tests (Postgres)
@@ -91,7 +224,15 @@ jobs:
         run: pip install -r tests/requirements.txt cryptography
 
       - name: Run API isolation + lifecycle tests
-        run: PYTHONPATH=api MODE=hosted pytest tests/integration/isolation/ tests/integration/test_kb_lifecycle.py tests/integration/test_note_lifecycle.py -v
+        run: >-
+          PYTHONPATH=api MODE=hosted pytest
+          tests/integration/isolation/
+          tests/integration/test_events.py
+          tests/integration/test_kb_lifecycle.py
+          tests/integration/test_note_lifecycle.py
+          tests/integration/test_text_quota_accounting.py
+          tests/integration/test_quiz_quota.py
+          -v
 
       - name: Run MCP Postgres isolation tests
         working-directory: mcp

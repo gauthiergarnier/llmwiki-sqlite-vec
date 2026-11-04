@@ -8,9 +8,11 @@ venv/
 
 # Build
 .next/
+.wxt/
+.output/
 dist/
 *.egg-info/
-tsconfig.tsbuildinfo
+*.tsbuildinfo
 
 # Secrets — NEVER commit
 .env
@@ -48,3 +50,17 @@ nvidia-10k-first20.md
 .claude
 .playwright-mcp
 .pytest_cache
+
+CLAUDE.md
+
+# Supabase CLI cache
+supabase/.temp/
+
+# Local-only specs / scratch docs
+docs/
+
+# Local-only developer scripts (apply_migration.sh, one-shot utilities)
+scripts/
+# impeccable skill artifacts
+.impeccable/
+PRODUCT.md

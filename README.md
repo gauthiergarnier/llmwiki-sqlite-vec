@@ -1,22 +1,38 @@
-# LLM Wiki + sqlite-vec
+# LLM Wiki
+
+**An autonomous, self-maintaining personal Wikipedia built and maintained by AI.**
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-green)](https://opensource.org/licenses/Apache-2.0)
 
-Fork of [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki) that adds **hybrid semantic search** to the local SQLite backend using [sqlite-vec](https://github.com/asg017/sqlite-vec).
+</div>
 
-The original LLM Wiki uses SQLite FTS5 (porter stemming) for keyword-only search in local mode. This fork adds vector embeddings via `all-MiniLM-L6-v2` and combines both signals using Reciprocal Rank Fusion (RRF), so search finds results by meaning — not just matching keywords.
+LLM Wiki transforms your scattered reading and research into a persistent, AI-maintained second brain. Capture documents, notes, and web clippings as you work, and deploy a nightly Claude Routine to autonomously synthesize those sources into a permanent knowledge base. Because the clipper captures your highlights and margin notes alongside the source, the wiki becomes a record of not just what you read but what you *thought* about it — one that compounds over months and years, long after the original context would have faded. This architecture is heavily inspired by [Andrej Karpathy's LLM Wiki concept](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f), with an increased emphasis on autonomous maintenance.
 
-Point it at a folder, start the local app, and connect Claude over MCP. From there, Claude reads your sources, writes wiki pages, and keeps links and citations in sync.
+<p align="center">
+  <img src="wiki-page.png" alt="LLM Wiki — a compiled wiki page with citations and table of contents" width="820" />
+</p>
 
-![LLM Wiki — a compiled wiki page with citations and table of contents](wiki-page.png)
 
-## Why we made these changes
+LLM Wiki is designed to work at three distinct scales:
 
-The original LLM Wiki searches your documents the same way a book index works: it looks for the exact words you typed. If your notes say "machine learning" but you search for "AI", nothing comes back. This is called **keyword search**, and while it's fast and reliable for precise terms, it has a fundamental blind spot — it doesn't understand what words *mean*.
+- **For you** — a personal Wikipedia of what you've read that you don't have to remember to update.
+- **For your AI** — a context layer for LLMs to apply your own mental models when working with you.
+- **For your organization** — most organizations have poor institutional memory, because know-how generally lives in people's heads. We hope companies will consider adopting this model to build a self-maintaining institutional knowledge layer.
 
-This fork fixes that by adding a second search engine that works more like your brain does. Here's the idea in plain terms:
+# About this fork
 
-### What changed
+This is [gauthiergarnier/llmwiki-sqlite-vec](https://github.com/gauthiergarnier/llmwiki-sqlite-vec), a fork of [lucasastorian/llmwiki](https://github.com/lucasastorian/llmwiki) that tracks upstream `master` and adds:
+
+- **Hybrid semantic search in local mode.** Upstream's local search is keyword-only (SQLite FTS5, every term must match). This fork adds local embeddings ([`all-MiniLM-L6-v2`](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2), 384-dim, CPU, ~80MB) stored with [sqlite-vec](https://github.com/asg017/sqlite-vec), fused with the keyword results by Reciprocal Rank Fusion.
+- **A sturdier citation graph.** Footnote targets are anchored on the file extension, so date-prefixed sources like `2026-06-23 - Meeting - Topic.md` resolve instead of being cut at the first ` - `, and an inline `**claim**[^x]:` at the end of a line no longer swallows the next line. Applied to both the MCP and API parsers.
+- **A self-contained `llmwiki reindex`.** After upstream's reindex it also chunks, rebuilds the reference graph and embeds everything (`api/reindex_finish.py`), so search and backlinks work without starting `serve`.
+- **`llmwiki` re-execs into `.venv`** when run with another interpreter (POSIX), so a bare `./llmwiki …` never runs without dependencies.
+- **Index stats** (documents, chunks, embeddings, citations) on the Settings page.
+- **An optional bi-temporal memory MCP server** (`memory/`, see below).
+
+### How hybrid search works
+
+#### What changed
 
 When you add a document to the wiki, the system now does two things instead of one:
 
@@ -26,108 +42,16 @@ When you add a document to the wiki, the system now does two things instead of o
 
 At search time, both engines run in parallel. Their results are merged using a scoring method called Reciprocal Rank Fusion — a document that scores well on *both* keyword match and meaning match rises to the top.
 
-### What this means for you
+#### What this means for you
 
 - **Search with natural language.** Ask "what are the risks of scaling?" and find chunks about "growth challenges", "bottlenecks", and "capacity limits" — even if none of those chunks contain the word "risk" or "scaling".
 - **Claude finds better sources.** When Claude searches your wiki to write or update pages, it retrieves more relevant material. Better retrieval means better-written pages with fewer gaps.
 - **Nothing breaks.** If you search for an exact filename or a specific technical term, keyword search still handles that perfectly. The two approaches complement each other.
 - **Everything stays local.** The AI model (~80MB) runs on your machine. No documents leave your computer, no API keys needed, no cloud dependency.
 
-### What we changed under the hood
+Under the hood, `shared/chunk_vectors.py` keeps the `chunk_vec` table in step with `document_chunks`: chunks without a vector are embedded (from the immutable `source_content`), vectors of deleted chunks are dropped. It runs in the background of the API and MCP processes — at startup, a couple of seconds after any chunk write, and every 5 minutes as a safety net — so writes stay fast. The first run on an existing workspace downloads the model and embeds everything once. Until a chunk is embedded, search simply falls back to keywords for it; if the model or sqlite-vec is unavailable, search is keyword-only, exactly like upstream.
 
-| Component | What changed |
-|-----------|-------------|
-| **Document ingestion** | Each text chunk now gets an embedding vector stored alongside it in a new `chunk_vec` table (powered by sqlite-vec) |
-| **Search** | Queries run against both FTS5 (keywords) and vec0 (vectors), results merged via RRF |
-| **Startup** | First launch downloads the embedding model and backfills vectors for any existing chunks |
-| **Dependencies** | Added `sqlite-vec` (vector storage) and `sentence-transformers` (embedding model) |
-| **Fallback** | If the embedding model isn't available, search degrades gracefully to keyword-only — the same behavior as before this fork |
-
-## What actually happens
-
-1. **You have a folder** — PDFs, notes, articles, spreadsheets. Your existing research.
-2. **LLM Wiki indexes it** — extracts text, chunks for search, builds a local SQLite index. Source files stay where they are.
-3. **Claude connects via MCP** — reads sources, writes wiki pages under `wiki/`, maintains cross-references and footnote citations.
-4. **The wiki improves** as Claude reads more of the workspace and writes more pages. Summaries, entity pages, and cross-references accumulate instead of being re-derived from scratch each conversation.
-
-## Quick Start
-
-**Requirements:** Python 3.11–3.13, Node.js 20+
-
-```bash
-git clone https://github.com/gauthiergarnier/llmwiki-sqlite-vec.git
-cd llmwiki-sqlite-vec
-
-# Install Python deps (single venv for both api and mcp)
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r api/requirements.txt -r mcp/requirements.txt
-
-# Install web deps
-cd web && npm install && cd ..
-
-# Initialize a workspace (point at any folder with your files)
-./llmwiki init ~/research
-
-# Start the app
-./llmwiki serve ~/research
-```
-
-On first startup, the embedding model (`all-MiniLM-L6-v2`, ~80MB) is downloaded automatically, and any existing chunks are backfilled with embeddings. This is a one-time cost.
-
-Open [localhost:3000](http://localhost:3000). Your files are indexed, wiki is scaffolded, ready to go.
-
-### Connect Claude
-
-```bash
-./llmwiki mcp-config ~/research
-```
-
-This prints a JSON snippet for `claude_desktop_config.json` (Claude Desktop) or `.claude/settings.json` (Claude Code). One workspace runs as one MCP server entry, so if you have multiple research folders, add one entry per folder.
-
-Then tell Claude: *"Read the guide, then ingest my sources and start building the wiki."*
-
-### One-command start
-
-```bash
-./llmwiki open ~/research
-```
-
-Does everything: init if needed, start servers, open browser, print MCP config hint.
-
-## CLI
-
-| Command | What it does |
-|---------|-------------|
-| `llmwiki open <folder>` | Init + serve + open browser |
-| `llmwiki init <folder>` | Create `.llmwiki/` + `wiki/`, index existing files |
-| `llmwiki serve <folder>` | Start API on :8000 + web on :3000 |
-| `llmwiki mcp <folder>` | Run stdio MCP server (for Claude config) |
-| `llmwiki mcp-config <folder>` | Print `claude_desktop_config.json` snippet |
-| `llmwiki reindex <folder>` | Rebuild the index from disk |
-
-## What happens on disk
-
-LLM Wiki adds two things to your folder. Source files are not moved or modified.
-
-```
-~/research/                  # Your existing files (untouched)
-  papers/paper.pdf
-  notes.md
-  data.xlsx
-  wiki/                      # Generated pages (created by LLM Wiki)
-    overview.md
-    log.md
-    concepts/
-      attention.md
-  .llmwiki/                  # Index + cache (hidden, rebuildable)
-    index.db
-    cache/
-```
-
-- `wiki/` — ordinary markdown files. Edit them in any editor. Claude writes and updates them via MCP.
-- `.llmwiki/` — SQLite search index and processed artifacts. Delete it anytime; `llmwiki reindex` rebuilds from the source files.
-
-## Memory (bi-temporal, optional parallel server)
+### Memory server (bi-temporal, optional)
 
 The wiki holds the *current synthesized state*. A second, **standalone** MCP server adds a continuously-learning memory layer so the knowledge base evolves over time instead of just being overwritten — it **supersedes** facts and decisions while *retaining* the old ones and the reasoning behind them.
 
@@ -153,155 +77,180 @@ Register both servers with Claude (`.mcp.json` / Claude Code `settings.json`):
 
 An optional background "sleep-time" consolidator (local LLM via Ollama) distills episodes and sweeps for contradictions when you're idle, applying confident merges and escalating uncertain ones as clarifications. See [`memory/README.md`](memory/README.md) for setup, configuration, and scheduling.
 
-By default, indexing, storage, and file writes happen on your machine. No cloud services required.
+### Fork setup notes
 
-## How Claude interacts with the workspace
+Install exactly as below, but clone this fork. The single `.venv` at the repo root serves `api/`, `mcp/` and `memory/`; `sqlite-vec` and `sentence-transformers` are in `api/requirements.txt` and `mcp/requirements.txt`.
 
-Once connected, Claude has these tools:
+# Features
 
-| Tool | Description |
-|------|-------------|
-| `guide` | Explains how the wiki works, lists what's in the workspace |
-| `search` | Browse files (`list`) or full-text search (`search`) |
-| `read` | Read documents — PDFs with page ranges, glob batch reads |
-| `write` | Create wiki pages, edit with `str_replace`, append. SVG/CSV assets |
-| `delete` | Delete documents by path or glob pattern |
+- **Connect via MCP** Connect Claude.ai, Claude Cowork, Claude Code, or Codex (or any other MCP-compatible app)
+- **A Chrome extension** Clip webpages and PDFs as you read, highlight key sections, and leave comments that Claude can see over MCP.
+- **Uploads** Markdown, PowerPoint, PDFs, Word documents, and more.
+- **A clean Next.js web app** to navigate your own wikipedia — and view the underlying sources.
+- **Native cross-linking** between wiki pages, and back to the sources they came from.
+- **A graph viewer** to see how your concepts and entities relate.
+- **Visualizations** — Charts and other visualizations, including SVGs and Mermaid diagrams.
 
-All writes go to disk first, then update the search index. If Claude creates `/wiki/concepts/attention.md`, that file appears on disk immediately.
+# Getting started
 
-## Architecture
+LLM Wiki supports two modes: remote & local. You can self-host the remote app, or try it out for free at llmwiki.app. Or you can git clone the repository, and use the CLI to get started.
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────────────────┐
-│   Next.js    │────▶│   FastAPI    │────▶│   SQLite                 │
-│   Frontend   │     │   Backend    │     │   ├─ FTS5 (keywords)     │
-└──────────────┘     └──────┬───────┘     │   └─ vec0 (embeddings)   │
-                            │             └──────────────────────────┘
-                     ┌──────┴───────┐
-                     │  MCP Server  │◀──── Claude Desktop / Code
-                     │   (stdio)    │
-                     └──────────────┘
-                            │
-                     ┌──────┴───────┐
-                     │  Filesystem  │  ← source of truth
-                     └──────────────┘
-```
+Here's how to get started locally.
 
-The filesystem is the source of truth. SQLite is a derived index — it accelerates search and stores extracted page data, but it can always be rebuilt from the files. A background file watcher picks up changes you make outside the app.
+**Requirements:** Python 3.11+, Node.js 20+. Optional: [LibreOffice](https://www.libreoffice.org/) to extract Word/PowerPoint files, and a `MISTRAL_API_KEY` for higher-quality PDF OCR.
 
-## Hybrid search
+**1. Install.** Clone the repo and install the Python and web dependencies.
 
-Search combines two signals via **Reciprocal Rank Fusion** (RRF, k=60):
-
-| Signal | How it works | Good at |
-|--------|-------------|---------|
-| **FTS5 BM25** | Porter-stemmed keyword matching | Exact terms, names, acronyms |
-| **sqlite-vec cosine** | 384-dim embeddings from `all-MiniLM-L6-v2` | Synonyms, paraphrases, conceptual queries |
-
-Both run on every search query. Results are ranked by fused score so that a chunk appearing in both result sets ranks highest. If either signal is unavailable (e.g., no embeddings yet, or a malformed FTS query), search falls back gracefully to whichever signal works.
-
-Embeddings are generated locally at ingest time — no API keys or external services needed.
-
-## Document processing
-
-All processing runs locally. No API keys required for basic usage.
-
-| Format | Parser | Notes |
-|--------|--------|-------|
-| PDF | pdf-oxide | Rust-based text extraction. Works well for text-heavy papers. Scanned PDFs still benefit from real OCR. |
-| Markdown/Text | native | Indexed and chunked directly |
-| HTML | webmd | Strips nav/ads, extracts clean markdown |
-| Excel/CSV | openpyxl | Sheet-by-sheet extraction |
-| Images | native | Stored as-is, viewable inline |
-| Word/PowerPoint | LibreOffice | Optional. Install LibreOffice for office conversion; without it, these formats are stored but not extracted. |
-
-Set `MISTRAL_API_KEY` for higher-quality PDF OCR with better table and layout detection. pdf-oxide is the free default and handles most text-heavy documents well enough.
-
-## Limitations and tradeoffs
-
-- **One workspace = one MCP server.** If you work across multiple research projects, each gets its own folder and its own MCP entry. This is intentional — it keeps context and file access scoped.
-- **PDF table extraction is rough.** pdf-oxide extracts prose reliably but tables come through as messy text. For financial filings or data-heavy PDFs, Mistral OCR is significantly better.
-- **LibreOffice adds setup friction.** Office file conversion requires a local LibreOffice install. If you mostly work with PDFs and markdown, you can skip it entirely.
-- **Embedding model adds ~80MB to disk.** The `all-MiniLM-L6-v2` model is downloaded on first use. Embedding generation runs on CPU and adds a few seconds to document ingestion.
-
-## Self-hosting the multi-tenant version
-
-If you want to run the hosted version (like [llmwiki.app](https://llmwiki.app)) with Postgres, Supabase auth, and S3:
-
-<details>
-<summary>Hosted setup instructions</summary>
-
-### Prerequisites
-
-- Python 3.11+
-- Node.js 20+
-- A [Supabase](https://supabase.com) project
-- An S3-compatible bucket
-
-### Database
+macOS / Linux:
 
 ```bash
-psql $DATABASE_URL -f supabase/migrations/001_initial.sql
+git clone https://github.com/lucasastorian/llmwiki.git
+cd llmwiki
+python -m venv .venv && source .venv/bin/activate
+pip install -r api/requirements.txt -r mcp/requirements.txt
+cd web && npm install && cd ..
 ```
 
-### API
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/lucasastorian/llmwiki.git
+cd llmwiki
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r api/requirements.txt -r mcp/requirements.txt
+cd web; npm install; cd ..
+```
+
+If activation is blocked by your execution policy, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` once, or skip activation and use `.venv\Scripts\python` in place of `python` below.
+
+**2. Point it at a folder of your files** — PDFs, Word documents, PowerPoints, Markdown, notes. Use any folder on your disk (it does **not** go inside this repo): the one that already holds your documents, or a fresh empty one. LLM Wiki indexes it into a local search index so the files show up in the app and Claude can read them. It never moves, modifies, or uploads your files — the only things it adds are a `wiki/` folder for generated pages and a hidden `.llmwiki/` index (see [What happens on disk](#what-happens-on-disk)).
 
 ```bash
-cd api
-pip install -r requirements.txt
-MODE=hosted DATABASE_URL=postgresql://... uvicorn main:app --port 8000
+./llmwiki open ~/research                     # macOS / Linux
+python llmwiki open C:\Users\you\research     # Windows
 ```
 
-### MCP Server
+This initializes the workspace, indexes the folder, starts the API and web app, and opens [localhost:3000](http://localhost:3000).
+Local mode is intentionally loopback-only: the API listens on `127.0.0.1` and does not support LAN or remote binding.
 
-```bash
-cd mcp
-pip install -r requirements.txt
-MODE=hosted DATABASE_URL=postgresql://... uvicorn server:app --port 8080
-```
-
-### Web
+To preview the hosted onboarding UX locally without authentication or API writes, start the web app with the development-only preview flag and open [localhost:3000/onboarding](http://localhost:3000/onboarding):
 
 ```bash
 cd web
-npm install
-NEXT_PUBLIC_MODE=hosted \
-NEXT_PUBLIC_SUPABASE_URL=https://your-ref.supabase.co \
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key \
-NEXT_PUBLIC_API_URL=http://localhost:8000 \
-npm run dev
+NEXT_PUBLIC_ONBOARDING_PREVIEW=true npm run dev
 ```
 
-### Environment Variables
+Restart the development server after changing this flag. The preview simulates creation and completion in memory; it does not create a wiki or change onboarding state.
 
-**API**
-```
-MODE=hosted
-DATABASE_URL=postgresql://...
-SUPABASE_URL=https://your-ref.supabase.co
-AWS_ACCESS_KEY_ID=...
-AWS_SECRET_ACCESS_KEY=...
-S3_BUCKET=your-bucket
-MISTRAL_API_KEY=              # optional, for better PDF OCR
-CONVERTER_URL=                # optional, for office conversion
+**3. Connect Claude over MCP.** MCP enables Claude to read, write, and search your wiki.
+
+```bash
+./llmwiki mcp-config ~/research                     # macOS / Linux
+python llmwiki mcp-config C:\Users\you\research     # Windows
 ```
 
-**Web**
+Paste the printed JSON into `claude_desktop_config.json` (Claude Desktop) or `.claude/settings.json` (Claude Code). One workspace is one MCP server entry, so add one per folder. Then tell Claude: *"Read the guide, then ingest my sources and start building the wiki."*
+
+**4. Make it self-maintaining.** Set up a Claude Routine — a scheduled prompt that runs on its own — so Claude refreshes the wiki without you having to remember to. Each run, it reads whatever's new in the workspace since last time (uploads, notes, and clips and highlights from the Chrome extension) and updates the pages those sources touch. You curate the sources; the wiki keeps itself current.
+
+A routine prompt that works well:
+
+> *Read the guide. Find everything added to the workspace since your last run — new sources, clips, and highlights. For each one, read it and update the wiki: write new pages where they're warranted, fold new material into existing pages, and fix any cross-references or citations it affects.*
+
+Then schedule that prompt to run nightly. [Claude Code Routines](https://code.claude.com/docs/en/routines) run it on Anthropic's cloud on a fixed cadence even when your laptop is closed — create one at [claude.ai/code/routines](https://claude.ai/code/routines), with `/schedule` in the CLI, or from Claude Cowork — while a [Desktop scheduled task](https://code.claude.com/docs/en/desktop-scheduled-tasks) runs the same prompt on your own machine. Either way the wiki compounds: a year from now you can open it and read back the ideas you were working through a year ago.
+
+# Adding content
+
+There are two ways to get material into your wiki.
+
+**Upload.** Drag files into the web app, or just drop them into the workspace folder — the background watcher picks them up and indexes them. Markdown, PDF, Word, PowerPoint, Excel, images, and more. Each file becomes searchable and readable by Claude.
+
+**Chrome extension.** Clip web pages and PDFs as you read, highlight the parts that matter, and leave comments. Everything you save lands in the same workspace, and your highlights and notes are visible to Claude over MCP — so a nightly routine can fold them into the wiki on its own.
+
+[Install from the Chrome Web Store →](https://chromewebstore.google.com/detail/llm-wiki/dibilaenlekndomfbampadehjeahemha)
+
+The extension works in both modes. By default it talks to the hosted app; flip the toggle to **Local** and it points at your running workspace at `http://localhost:8000` — so anything you clip while `./llmwiki open` is running goes straight into your local wiki. Pick a destination folder (default `/webclipper/`) and start saving.
+
+# Supported files
+
+| Type | Formats | How it's handled |
+|------|---------|------------------|
+| PDF | `.pdf` | Text and figures extracted locally. Set `MISTRAL_API_KEY` for higher-quality OCR on tables and complex layouts. |
+| Office | `.docx` `.doc` `.pptx` `.ppt` | Converted with LibreOffice, then extracted — requires a local LibreOffice install. |
+| Spreadsheets | `.xlsx` `.xls` | Extracted sheet by sheet. |
+| Web pages | `.html` `.htm` | Cleaned to readable Markdown, stripping nav and ads. |
+| Text & data | `.md` `.txt` `.csv` `.json` `.xml` `.yaml` `.svg`, and more | Indexed and chunked directly. |
+| Images | `.png` `.jpg` `.webp` `.gif` | Stored and viewable inline; Claude can read them when asked. |
+
+# What happens on disk
+
+LLM Wiki adds exactly two things to the folder you point it at. Your source files are never moved, modified, or uploaded — they stay exactly where they are.
+
 ```
-NEXT_PUBLIC_MODE=hosted
-NEXT_PUBLIC_SUPABASE_URL=https://your-ref.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=your-anon-key
-NEXT_PUBLIC_API_URL=http://localhost:8000
+~/research/                  # your files, untouched
+  papers/paper.pdf
+  notes.md
+  data.xlsx
+  wiki/                      # generated pages — created by LLM Wiki
+    overview.md
+    concepts/
+      attention.md
+  .llmwiki/                  # index + cache — hidden, rebuildable
+    index.db
+    cache/
 ```
 
-</details>
+- **`wiki/`** holds ordinary Markdown files. Claude writes and updates them over MCP, but they're just files — open them in any editor, commit them to git, edit them by hand.
+- **`.llmwiki/`** holds the SQLite index (`index.db`) and extracted artifacts (`cache/`). Search can be rebuilt from your files with `./llmwiki reindex ~/research`, but highlights, comments, agent replies, course progress and clip metadata live only in `index.db` — back it up, and don't delete it. `reindex` saves a timestamped copy before rebuilding.
 
-## Why this beats a static notes folder
+The filesystem is the source of truth; the index just makes it fast to search. A background watcher notices changes you make outside the app and re-indexes them, so editing a wiki page in your own editor stays in sync.
 
-Personal wikis usually fail on maintenance, not intent. Someone has to update links, fix stale summaries, merge overlapping pages, and keep citations aligned with the source material. That work scales with the number of sources, and people stop doing it.
+# What Claude can do
 
-LLM Wiki offloads that editing work. You choose the source material and direct the analysis. Claude handles the repetitive bookkeeping — updating cross-references, keeping summaries current, flagging contradictions, touching the 15 pages that a single new source affects.
+Once connected over MCP, Claude works the wiki through a small, deliberate set of tools — the same set in local and hosted mode:
 
-## License
+| Tool | What it does |
+|------|--------------|
+| `guide` | Orients Claude — how the vault works and which knowledge bases exist. It calls this first. |
+| `create_knowledge_base` | Creates a knowledge base and starter `overview.md`; local mode returns the existing singleton workspace. |
+| `list_knowledge_bases` | Lists your knowledge bases and their slugs (every other tool takes one). |
+| `search` | Browse files, full-text search across content, or query the citation graph — what cites what, plus stale or uncited pages. |
+| `read` | Read documents — a single file or a glob batch, PDF/office page ranges, optionally with embedded images. |
+| `create` | Create a wiki page, note, or asset (SVG diagram, CSV) with footnote citations back to sources. |
+| `edit` | Find-and-replace exact text in an existing page. |
+| `append` | Add content to the end of a page. |
+| `delete` | Remove pages or sources by path or glob (`overview.md` and any legacy `log.md` are protected). |
+| `lint` | Deterministic hygiene checks — citation resolution, dangling links, orphan and stale pages, frontmatter consistency. |
 
-Apache 2.0
+Writes go to the source of truth first — a file on disk in local mode, Postgres in hosted mode — then the search index updates. So when Claude creates `/wiki/concepts/attention.md`, it's a real file (or row) immediately, not a pending change.
+
+# Architecture
+
+Three kinds of client reach the workspace, through two entry services, over one storage abstraction:
+
+```
+  Claude  ──MCP──►  MCP server ─┐
+                                │                local mode  →  SQLite + your filesystem
+  Web app ──HTTP─►  API ────────┼──►  VaultFS  ─┤
+                                │                hosted mode →  Postgres + S3
+  Chrome  ──HTTP─►  API ────────┘
+                      └──►  Converter  (PDF / Office text extraction)
+```
+
+`VaultFS` is the seam: the same wiki operations run against a SQLite-plus-filesystem backend locally or a Postgres-plus-S3 backend when hosted, so Claude's tools behave identically either way. The MCP server speaks to Claude; the API serves the web app and the Chrome extension; the converter handles heavier PDF and Office extraction. Whatever the backend, the durable store is the source of truth and the search index is derived from it.
+
+# What's next
+
+Today you add content two ways: upload, or the Chrome extension. The wiki is only as good as what reaches it, so the roadmap is mostly about widening that funnel — more channels for capturing what you read, write, and discuss:
+
+- **Slack** — save messages and threads, and ask the wiki questions, without leaving Slack. This is the natural channel for the institutional-memory case: most of what an organization knows is already flowing through chat.
+- **Granola** — pull in your meeting notes automatically, so the conversations you have become part of your memory alongside the things you read.
+- **Email / forward-to-save** — a dedicated address you forward articles, newsletters, and notes to; they land in the workspace and the nightly routine folds them in.
+- **Public ingest API + webhooks** — a documented endpoint so scripts and other tools can push content into a workspace programmatically, plus a **Zapier** integration to wire up the apps you already use without writing code.
+
+The throughline: capture should meet you wherever you already read and think, and the wiki keeps itself current from there.
+
+# License
+
+Apache 2.0 — see [LICENSE](LICENSE).

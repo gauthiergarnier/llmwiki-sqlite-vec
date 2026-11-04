@@ -30,6 +30,7 @@ async def client(pool):
     from services.hosted import HostedServiceFactory
 
     app.state.pool = pool
+    app.state.mode = "hosted"
     app.state.s3_service = None
     app.state.ocr_service = None
     app.state.auth_provider = None

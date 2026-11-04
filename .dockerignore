@@ -1,0 +1,17 @@
+.git
+**/.llmwiki
+wiki
+**/__pycache__
+**/.venv
+**/venv
+**/node_modules
+web/.next
+web/out
+extension
+screenshots
+docs
+scripts
+tests
+**/.pytest_cache
+**/.DS_Store
+**/*.log

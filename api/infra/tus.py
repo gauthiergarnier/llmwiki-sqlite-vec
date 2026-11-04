@@ -1,26 +1,105 @@
-import json
-import time
 import asyncio
 import logging
-from uuid import uuid4
-from pathlib import Path
+import re
+import time
 from base64 import b64decode
 from dataclasses import dataclass, field
-
-from fastapi import APIRouter, Request, HTTPException, Response
+from pathlib import Path
+from uuid import uuid4
 
 from auth import get_current_user
 from config import settings
+from fastapi import APIRouter, HTTPException, Request, Response
+from starlette.requests import ClientDisconnect
 
 logger = logging.getLogger(__name__)
+
+FLUSH_SIZE_BYTES = 1_048_576
 
 
 def _append_file(path: Path, data: bytes):
     with open(path, "ab") as f:
         f.write(data)
 
+
+@dataclass
+class _StreamResult:
+    bytes_written: int
+    overflow: bool
+    disconnected: bool
+
+
+async def _drain_to_temp(request: Request, temp_path: Path, remaining: int) -> _StreamResult:
+    """Append the PATCH body to temp_path, capped at `remaining` bytes."""
+    buf = bytearray()
+    bytes_written = 0
+    try:
+        async for chunk in request.stream():
+            if bytes_written + len(buf) + len(chunk) > remaining:
+                return _StreamResult(bytes_written, overflow=True, disconnected=False)
+            buf.extend(chunk)
+            if len(buf) >= FLUSH_SIZE_BYTES:
+                await asyncio.to_thread(_append_file, temp_path, bytes(buf))
+                bytes_written += len(buf)
+                buf.clear()
+    except ClientDisconnect:
+        bytes_written += await _flush(temp_path, buf)
+        return _StreamResult(bytes_written, overflow=False, disconnected=True)
+    bytes_written += await _flush(temp_path, buf)
+    return _StreamResult(bytes_written, overflow=False, disconnected=False)
+
+
+async def _flush(temp_path: Path, buf: bytearray) -> int:
+    """Append any buffered bytes to disk; return how many were written."""
+    if not buf:
+        return 0
+    await asyncio.to_thread(_append_file, temp_path, bytes(buf))
+    return len(buf)
+
+
+_FILE_SIGNATURES: dict[str, tuple[tuple[bytes, ...], ...]] = {
+    "pdf":  ((b"%PDF-",),),
+    "png":  ((b"\x89PNG\r\n\x1a\n",),),
+    "jpg":  ((b"\xff\xd8\xff",),),
+    "jpeg": ((b"\xff\xd8\xff",),),
+    "webp": ((b"RIFF",),),
+    "gif":  ((b"GIF87a", b"GIF89a"),),
+    # OOXML is a ZIP container; legacy Office is CFB (Compound File Binary).
+    "pptx": ((b"PK\x03\x04",),),
+    "docx": ((b"PK\x03\x04",),),
+    "xlsx": ((b"PK\x03\x04",),),
+    "ppt":  ((b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),),
+    "doc":  ((b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),),
+    # csv/html are text with no reliable magic bytes, so they're deliberately unchecked.
+}
+
+
+def _validate_file_signature(temp_path: Path, ext: str) -> None:
+    """Refuse files whose first bytes don't match their declared extension."""
+    signatures = _FILE_SIGNATURES.get(ext)
+    if not signatures:
+        return
+    try:
+        with open(temp_path, "rb") as f:
+            head = f.read(16)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=f"Could not read upload: {e}") from e
+    if ext == "webp":
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return
+        raise HTTPException(status_code=400, detail="File content does not match declared type .webp")
+    for group in signatures:
+        for prefix in group:
+            if head.startswith(prefix):
+                return
+    raise HTTPException(
+        status_code=400,
+        detail=f"File content does not match declared type .{ext}",
+    )
+
 TUS_VERSION = "1.0.0"
 MAX_SIZE = 104_857_600  # 100 MB
+MAX_HTML_SIZE = 10 * 1024 * 1024
 UPLOAD_DIR = Path("/tmp/supavault_tus_uploads")
 STALE_SECONDS = 3600
 
@@ -30,7 +109,7 @@ ALLOWED_EXTENSIONS = {
     ".docx": "docx", ".doc": "doc",
     ".png": "png", ".jpg": "jpg", ".jpeg": "jpeg",
     ".webp": "webp", ".gif": "gif",
-    ".xlsx": "xlsx", ".xls": "xls", ".csv": "csv",
+    ".xlsx": "xlsx", ".csv": "csv",
     ".html": "html", ".htm": "html",
 }
 CONTENT_TYPES = {
@@ -42,7 +121,7 @@ CONTENT_TYPES = {
     "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
     "webp": "image/webp", "gif": "image/gif",
     "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "xls": "application/vnd.ms-excel", "csv": "text/csv",
+    "csv": "text/csv",
     "html": "text/html", "htm": "text/html",
 }
 
@@ -58,7 +137,9 @@ class TusUpload:
     filename: str
     knowledge_base_id: str
     temp_path: Path
+    path: str = "/"
     last_activity: float = field(default_factory=time.time)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
 
 _uploads: dict[str, TusUpload] = {}
@@ -81,8 +162,8 @@ def _parse_metadata(header: str) -> dict[str, str]:
         if len(parts) > 1:
             try:
                 value = b64decode(parts[1]).decode("utf-8")
-            except Exception:
-                raise HTTPException(status_code=400, detail=f"Invalid base64 in Upload-Metadata key '{key}'")
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid base64 in Upload-Metadata key '{key}'") from e
         else:
             value = ""
         result[key] = value
@@ -112,6 +193,19 @@ async def _finalize(upload: TusUpload, app_state) -> str:
     title = upload.filename.rsplit(".", 1)[0] if "." in upload.filename else upload.filename
     file_size = upload.upload_length
 
+    try:
+        _validate_file_signature(upload.temp_path, ext)
+        actual_size = upload.temp_path.stat().st_size
+        if actual_size != upload.upload_length:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Upload size mismatch: declared {upload.upload_length}, actual {actual_size}",
+            )
+    except HTTPException:
+        upload.temp_path.unlink(missing_ok=True)
+        _uploads.pop(upload.upload_id, None)
+        raise
+
     s3_service = app_state.s3_service
     if not s3_service:
         raise ValueError("File storage not configured")
@@ -119,18 +213,65 @@ async def _finalize(upload: TusUpload, app_state) -> str:
 
     pool = app_state.pool
     try:
-        await pool.execute(
-            "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
-            "file_type, file_size, status) "
-            "VALUES ($1::uuid, $2::uuid, $3, $4, '/', $5, $6, $7, 'pending')",
-            document_id,
-            upload.knowledge_base_id,
-            user_id,
-            upload.filename,
-            title,
-            file_type,
-            file_size,
-        )
+        conn = await pool.acquire()
+        try:
+            async with conn.transaction():
+                # Same per-user lock as text/URL-ingest writes, so a concurrent note can't overspend quota.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext($1::text))",
+                    user_id,
+                )
+                kb_owner = await conn.fetchval(
+                    "SELECT user_id::text FROM knowledge_bases WHERE id = $1::uuid",
+                    upload.knowledge_base_id,
+                )
+                if kb_owner != user_id:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="Knowledge base not found or no longer owned by you",
+                    )
+
+                limits = await conn.fetchrow(
+                    "SELECT storage_limit_bytes FROM users WHERE id = $1",
+                    user_id,
+                )
+                storage_limit = (
+                    limits["storage_limit_bytes"]
+                    if limits else settings.QUOTA_MAX_STORAGE_BYTES
+                )
+                current_bytes = await conn.fetchval(
+                    "SELECT COALESCE(SUM(file_size), 0) "
+                    "FROM documents WHERE user_id = $1",
+                    user_id,
+                )
+                current_bytes = current_bytes or 0
+                if current_bytes + file_size > storage_limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Storage quota changed while the upload was in progress",
+                    )
+
+                await conn.execute(
+                    "INSERT INTO documents (id, knowledge_base_id, user_id, filename, path, title, "
+                    "file_type, file_size, status) "
+                    "VALUES ($1::uuid, $2::uuid, $3, $4, $8, $5, $6, $7, 'pending')",
+                    document_id,
+                    upload.knowledge_base_id,
+                    user_id,
+                    upload.filename,
+                    title,
+                    file_type,
+                    file_size,
+                    upload.path,
+                )
+        finally:
+            await pool.release(conn)
+    except Exception:
+        try:
+            await s3_service.delete_prefix(f"{user_id}/{document_id}/")
+        except Exception:
+            logger.exception("Failed to clean S3 object after TUS finalization error")
+        raise
     finally:
         upload.temp_path.unlink(missing_ok=True)
         _uploads.pop(upload.upload_id, None)
@@ -147,7 +288,10 @@ async def cleanup_stale_uploads():
     while True:
         await asyncio.sleep(60)
         now = time.time()
-        stale = [uid for uid, u in _uploads.items() if now - u.last_activity > STALE_SECONDS]
+        stale = [
+            uid for uid, u in _uploads.items()
+            if not u.lock.locked() and now - u.last_activity > STALE_SECONDS
+        ]
         for uid in stale:
             upload = _uploads.pop(uid, None)
             if upload:
@@ -181,8 +325,10 @@ async def tus_create(request: Request):
         raise HTTPException(status_code=400, detail="Missing Upload-Length header")
     try:
         upload_length = int(upload_length_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Upload-Length")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid Upload-Length") from e
+    if upload_length < 1:
+        raise HTTPException(status_code=400, detail="Upload-Length must be positive")
     if upload_length > MAX_SIZE:
         raise HTTPException(status_code=413, detail=f"Upload-Length exceeds maximum of {MAX_SIZE} bytes")
 
@@ -199,6 +345,11 @@ async def tus_create(request: Request):
             status_code=400,
             detail=f"Unsupported file type. Allowed: {', '.join(ALLOWED_EXTENSIONS.keys())}",
         )
+    if ext in {".html", ".htm"} and upload_length > MAX_HTML_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"HTML uploads exceed the {MAX_HTML_SIZE // (1024 * 1024)} MiB limit",
+        )
 
     kb_id = metadata.get("knowledge_base_id", "").strip()
     if not kb_id:
@@ -209,8 +360,8 @@ async def tus_create(request: Request):
     try:
         import uuid as _uuid
         _uuid.UUID(kb_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid knowledge_base_id format")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid knowledge_base_id format") from e
 
     kb_owner = await pool.fetchval(
         "SELECT user_id::text FROM knowledge_bases WHERE id = $1::uuid",
@@ -242,6 +393,13 @@ async def tus_create(request: Request):
     temp_path = UPLOAD_DIR / upload_id
     temp_path.touch()
 
+    raw_path = metadata.get("path", "/").strip() or "/"
+    upload_path = "/" + raw_path.replace("\\", "/").strip("/") + "/"
+    upload_path = re.sub(r"/\.\.(/|$)", "/", upload_path)  # strip traversal
+    upload_path = re.sub(r"/+", "/", upload_path)  # collapse double slashes
+    if upload_path == "//":
+        upload_path = "/"
+
     upload = TusUpload(
         upload_id=upload_id,
         user_id=user_id,
@@ -250,6 +408,7 @@ async def tus_create(request: Request):
         filename=filename,
         knowledge_base_id=kb_id,
         temp_path=temp_path,
+        path=upload_path,
     )
     _uploads[upload_id] = upload
 
@@ -287,42 +446,50 @@ async def tus_patch(upload_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Missing Upload-Offset header")
     try:
         client_offset = int(offset_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid Upload-Offset")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="Invalid Upload-Offset") from e
 
-    if client_offset != upload.upload_offset:
-        raise HTTPException(status_code=409, detail="Offset mismatch")
+    # Compare-and-append (incl. finalization) is serialized so concurrent PATCHes can't both pass the offset check.
+    async with upload.lock:
+        # A concurrent PATCH may have finalized and removed this upload while we waited.
+        if _uploads.get(upload_id) is not upload:
+            raise HTTPException(status_code=404, detail="Upload not found")
 
-    FLUSH_SIZE = 1_048_576
-    buf = bytearray()
-    bytes_written = 0
-    async for chunk in request.stream():
-        buf.extend(chunk)
-        if len(buf) >= FLUSH_SIZE:
-            await asyncio.to_thread(_append_file, upload.temp_path, bytes(buf))
-            bytes_written += len(buf)
-            buf.clear()
+        if client_offset != upload.upload_offset:
+            raise HTTPException(status_code=409, detail="Offset mismatch")
 
-    if buf:
-        await asyncio.to_thread(_append_file, upload.temp_path, bytes(buf))
-        bytes_written += len(buf)
-    upload.upload_offset += bytes_written
+        upload.last_activity = time.time()
 
-    upload.last_activity = time.time()
+        remaining = upload.upload_length - upload.upload_offset
+        result = await _drain_to_temp(request, upload.temp_path, remaining)
+        upload.upload_offset += result.bytes_written
+        upload.last_activity = time.time()
 
-    if upload.upload_offset > upload.upload_length:
-        upload.temp_path.unlink(missing_ok=True)
-        _uploads.pop(upload_id, None)
-        raise HTTPException(status_code=400, detail="Upload exceeded declared length")
+        if result.overflow:
+            raise HTTPException(status_code=413, detail="Body exceeds declared Upload-Length")
 
-    headers = _tus_headers({"Upload-Offset": str(upload.upload_offset)})
+        if result.disconnected:
+            # Received bytes are persisted, so the client resumes from HEAD.
+            return Response(
+                status_code=204,
+                headers=_tus_headers({"Upload-Offset": str(upload.upload_offset)}),
+            )
 
-    if upload.upload_offset == upload.upload_length:
-        try:
-            document_id = await _finalize(upload, request.app.state)
-            headers["X-Document-Id"] = document_id
-        except Exception:
-            logger.exception("TUS finalization failed for upload %s", upload_id)
-            raise HTTPException(status_code=500, detail="Finalization failed")
+        if upload.upload_offset > upload.upload_length:
+            upload.temp_path.unlink(missing_ok=True)
+            _uploads.pop(upload_id, None)
+            raise HTTPException(status_code=400, detail="Upload exceeded declared length")
 
-    return Response(status_code=204, headers=headers)
+        headers = _tus_headers({"Upload-Offset": str(upload.upload_offset)})
+
+        if upload.upload_offset == upload.upload_length:
+            try:
+                document_id = await _finalize(upload, request.app.state)
+                headers["X-Document-Id"] = document_id
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.exception("TUS finalization failed for upload %s", upload_id)
+                raise HTTPException(status_code=500, detail="Finalization failed") from e
+
+        return Response(status_code=204, headers=headers)

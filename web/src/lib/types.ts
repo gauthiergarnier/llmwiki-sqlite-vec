@@ -8,6 +8,9 @@ export interface KnowledgeBase {
   wiki_page_count: number
   created_at: string
   updated_at: string
+  kind?: 'wiki' | 'course'
+  lesson_count?: number
+  lessons_completed?: number
 }
 
 export interface Document {
@@ -37,6 +40,49 @@ export interface Document {
 
 export type DocumentListItem = Omit<Document, 'content'>
 
+export type KnowledgeBaseEventType =
+  | 'tracking.started'
+  | 'wiki.created'
+  | 'page.created'
+  | 'page.updated'
+  | 'page.archived'
+  | 'page.restored'
+  | 'page.deleted'
+  | 'source.added'
+  | 'source.updated'
+  | 'source.deleted'
+
+export type KnowledgeBaseEventChange =
+  | 'content'
+  | 'title'
+  | 'path'
+  | 'tags'
+  | 'date'
+  | 'properties'
+
+export interface KnowledgeBaseEvent {
+  id: string
+  event_type: KnowledgeBaseEventType
+  subject_kind: 'wiki' | 'wiki_page' | 'source'
+  document_id: string | null
+  document_number: number | null
+  document_version: number | null
+  subject_title: string
+  subject_path: string | null
+  metadata: {
+    changes?: KnowledgeBaseEventChange[]
+    file_type?: string
+    file_size?: number
+    [key: string]: unknown
+  }
+  occurred_at: string
+}
+
+export interface KnowledgeBaseEventsPage {
+  items: KnowledgeBaseEvent[]
+  next_cursor: string | null
+}
+
 export type PropertyType = 'text' | 'number' | 'date' | 'checkbox' | 'select' | 'url'
 
 export interface TypedProperty {
@@ -52,9 +98,7 @@ export interface WikiNode {
   path?: string
   docNumber?: number | null
   children?: WikiNode[]
-}
-
-export interface WikiSubsection {
-  id: string
-  title: string
+  // Course mode only — derived from the lesson doc's metadata.course.status + tree order.
+  status?: 'complete' | 'in_progress' | 'not_started'
+  locked?: boolean
 }

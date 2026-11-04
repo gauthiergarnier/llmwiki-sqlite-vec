@@ -4,16 +4,28 @@ import * as React from 'react'
 import { Suspense } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { Loader2, Shield, Check, X } from 'lucide-react'
+import type { OAuthAuthorizationDetails } from '@supabase/supabase-js'
 import { createClient } from '@/lib/supabase/client'
+import { Button } from '@/components/ui/button'
+
+function redirectHost(uri: string): string {
+  try {
+    return new URL(uri).host
+  } catch {
+    return uri
+  }
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof Error && err.message) return err.message
+  return fallback
+}
 
 function OAuthConsentContent() {
   const searchParams = useSearchParams()
   const authorizationId = searchParams.get('authorization_id')
 
-  const [details, setDetails] = React.useState<{
-    client?: { name?: string }
-    scopes?: string[]
-  } | null>(null)
+  const [details, setDetails] = React.useState<OAuthAuthorizationDetails | null>(null)
   const [loading, setLoading] = React.useState(true)
   const [error, setError] = React.useState<string | null>(null)
   const [submitting, setSubmitting] = React.useState(false)
@@ -36,54 +48,39 @@ function OAuthConsentContent() {
       }
 
       try {
-        const { data, error: fetchError } = await (supabase.auth as any).oauth.getAuthorizationDetails(authorizationId)
+        const { data, error: fetchError } = await supabase.auth.oauth.getAuthorizationDetails(authorizationId)
         if (fetchError) throw fetchError
+        if ('redirect_url' in data) {
+          window.location.href = data.redirect_url
+          return
+        }
         setDetails(data)
-      } catch (err: any) {
+      } catch (err: unknown) {
         console.error('Failed to get authorization details:', err)
+        setError(errorMessage(err, 'Could not load this authorization request. Start the connection again from your AI client.'))
       } finally {
         setLoading(false)
       }
     })
   }, [authorizationId])
 
-  const handleApprove = async () => {
+  const handleDecision = async (approve: boolean) => {
     if (!authorizationId || submitting) return
     setSubmitting(true)
     setError(null)
     try {
-      const supabase = createClient()
-      const result = await (supabase.auth as any).oauth.approveAuthorization(authorizationId)
-      if (result.error) throw result.error
-      const redirectUrl = result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
-      if (redirectUrl) {
-        window.location.href = redirectUrl
+      const oauth = createClient().auth.oauth
+      const { data, error: decisionError } = approve
+        ? await oauth.approveAuthorization(authorizationId)
+        : await oauth.denyAuthorization(authorizationId)
+      if (decisionError) throw decisionError
+      if (data?.redirect_url) {
+        window.location.href = data.redirect_url
       } else {
-        setSuccess('Access granted successfully.')
+        setSuccess(approve ? 'Access granted successfully.' : 'Access denied.')
       }
-    } catch (err: any) {
-      setError(err?.message || 'Failed to approve authorization.')
-    } finally {
-      setSubmitting(false)
-    }
-  }
-
-  const handleDeny = async () => {
-    if (!authorizationId || submitting) return
-    setSubmitting(true)
-    setError(null)
-    try {
-      const supabase = createClient()
-      const result = await (supabase.auth as any).oauth.denyAuthorization(authorizationId)
-      if (result.error) throw result.error
-      const redirectUrl = result.data?.redirect_to || result.data?.redirect_uri || result.data?.url
-      if (redirectUrl) {
-        window.location.href = redirectUrl
-      } else {
-        setSuccess('Access denied.')
-      }
-    } catch (err: any) {
-      setError(err?.message || 'Failed to deny authorization.')
+    } catch (err: unknown) {
+      setError(errorMessage(err, approve ? 'Failed to approve authorization.' : 'Failed to deny authorization.'))
     } finally {
       setSubmitting(false)
     }
@@ -123,9 +120,10 @@ function OAuthConsentContent() {
     )
   }
 
-  const rawName = details?.client?.name || ''
-  const isClaude = rawName.toLowerCase().includes('claude') || rawName.toLowerCase().includes('anthropic')
-  const clientName = isClaude ? 'Claude' : rawName || 'An MCP client'
+  if (!details) return null
+
+  const clientName = details.client.name || 'An MCP client'
+  const returnHost = redirectHost(details.redirect_uri)
 
   return (
     <div className="min-h-svh flex items-center justify-center bg-background p-8">
@@ -138,6 +136,9 @@ function OAuthConsentContent() {
           <p className="mt-2 text-sm text-muted-foreground">
             <span className="font-medium text-foreground">{clientName}</span> wants to connect
             to your LLM Wiki as an MCP server.
+          </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            After approving you&apos;ll be sent to <span className="font-medium text-foreground">{returnHost}</span>
           </p>
         </div>
 
@@ -170,21 +171,22 @@ function OAuthConsentContent() {
         </div>
 
         <div className="flex gap-3">
-          <button
-            onClick={handleDeny}
+          <Button
+            variant="outline"
+            onClick={() => handleDecision(false)}
             disabled={submitting}
-            className="flex-1 rounded-lg border border-input bg-background px-4 py-2.5 text-sm font-medium hover:bg-accent transition-colors cursor-pointer disabled:opacity-50"
+            className="flex-1"
           >
             Deny
-          </button>
-          <button
-            onClick={handleApprove}
+          </Button>
+          <Button
+            onClick={() => handleDecision(true)}
             disabled={submitting}
-            className="flex-1 flex items-center justify-center gap-2 rounded-lg bg-foreground text-background px-4 py-2.5 text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer disabled:opacity-50"
+            className="flex-1"
           >
             {submitting && <Loader2 size={14} className="animate-spin" />}
             Approve
-          </button>
+          </Button>
         </div>
 
         <p className="mt-4 text-[11px] text-center text-muted-foreground/50">

@@ -3,17 +3,23 @@
 import * as React from 'react'
 import { useRouter, usePathname } from 'next/navigation'
 import { useUserStore, useKBStore } from '@/stores'
-import { apiFetch } from '@/lib/api'
+import { apiFetch, isApiError } from '@/lib/api'
 
 const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
+
+function isAuthFailure(err: unknown): boolean {
+  return isApiError(err) && (err.status === 401 || err.status === 403)
+}
 
 interface AuthProviderProps {
   userId: string
   email: string
+  /** Token from the session the dashboard layout already verified; later rotations arrive via onAuthStateChange. */
+  accessToken: string
   children: React.ReactNode
 }
 
-export function AuthProvider({ userId, email, children }: AuthProviderProps) {
+export function AuthProvider({ userId, email, accessToken, children }: AuthProviderProps) {
   const router = useRouter()
   const pathname = usePathname()
   const setUser = useUserStore((s) => s.setUser)
@@ -22,66 +28,83 @@ export function AuthProvider({ userId, email, children }: AuthProviderProps) {
   const signOut = useUserStore((s) => s.signOut)
   const onboarded = useUserStore((s) => s.onboarded)
   const fetchKBs = useKBStore((s) => s.fetchKBs)
-  const initialized = React.useRef(false)
+  const pathnameRef = React.useRef(pathname)
 
   React.useEffect(() => {
-    if (initialized.current) return
-    initialized.current = true
+    pathnameRef.current = pathname
+  }, [pathname])
 
+  React.useEffect(() => {
     if (isLocal) {
-      // Local mode: static session, no Supabase
       setUser({ id: userId, email })
-      setAccessToken('local')
+      setAccessToken(accessToken)
       setOnboarded(true)
       fetchKBs()
       return
     }
 
-    // Hosted mode: Supabase session
-    import('@/lib/supabase/client').then(({ createClient }) => {
-      const supabase = createClient()
-      supabase.auth.getUser().then(async ({ data: { user: authUser } }) => {
-        if (!authUser) {
-          signOut()
-          useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
-          return
-        }
-        // Still need the session for the access_token
-        const { data: { session } } = await supabase.auth.getSession()
-        if (!session) {
-          signOut()
-          useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
-          return
-        }
-        setUser({ id: userId, email })
-        setAccessToken(session.access_token)
-        fetchKBs()
+    let cancelled = false
+    let subscription: { unsubscribe: () => void } | undefined
 
+    import('@/lib/supabase/client').then(({ createClient }) => {
+      if (cancelled) return
+      const supabase = createClient()
+
+      const bounceToLogin = async () => {
+        try { await supabase.auth.signOut({ scope: 'local' }) } catch { /* best-effort */ }
+        signOut()
+        useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
+        if (!cancelled) router.replace('/login')
+      }
+
+      ;(async () => {
         try {
-          const me = await apiFetch<{ onboarded: boolean }>('/v1/me', session.access_token)
-          setOnboarded(me.onboarded)
-          if (!me.onboarded && pathname !== '/onboarding') {
-            router.replace('/onboarding')
+          setUser({ id: userId, email })
+          setAccessToken(accessToken)
+          try {
+            await fetchKBs({ throwOnError: true })
+          } catch (err) {
+            if (isAuthFailure(err)) {
+              await bounceToLogin()
+              return
+            }
+          }
+
+          try {
+            const me = await apiFetch<{ onboarded: boolean }>('/v1/me', accessToken)
+            if (cancelled) return
+            setOnboarded(me.onboarded)
+            if (!me.onboarded && pathnameRef.current !== '/onboarding') {
+              router.replace('/onboarding')
+            }
+          } catch {
+            const stored = useUserStore.getState().onboarded
+            if (stored === null) setOnboarded(true)
           }
         } catch {
-          const stored = useUserStore.getState().onboarded
-          if (stored === null) setOnboarded(true)
+          await bounceToLogin()
         }
-      })
+      })()
 
-      const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      // Only an explicit SIGNED_OUT logs out; a null INITIAL_SESSION can be a transient storage/refresh failure.
+      const { data } = supabase.auth.onAuthStateChange((event, session) => {
+        if (cancelled) return
         if (session) {
           useUserStore.getState().setAccessToken(session.access_token)
-        } else {
+        } else if (event === 'SIGNED_OUT') {
           signOut()
           useKBStore.setState({ knowledgeBases: [], loading: false, error: null })
           router.replace('/login')
         }
       })
-
-      return () => subscription.unsubscribe()
+      subscription = data.subscription
     })
-  }, [userId, email, setUser, setAccessToken, setOnboarded, fetchKBs, router, pathname, signOut])
+
+    return () => {
+      cancelled = true
+      subscription?.unsubscribe()
+    }
+  }, [userId, email, accessToken, setUser, setAccessToken, setOnboarded, fetchKBs, router, signOut])
 
   React.useEffect(() => {
     if (!isLocal && onboarded === false && pathname !== '/onboarding') {

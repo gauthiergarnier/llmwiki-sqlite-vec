@@ -4,16 +4,37 @@ import * as React from 'react'
 import { Maximize2 } from 'lucide-react'
 import { DiagramViewer } from './DiagramViewer'
 
+function useIsDarkMode(): boolean {
+  const [isDark, setIsDark] = React.useState(false)
+  React.useEffect(() => {
+    const root = document.documentElement
+    const update = () => setIsDark(root.classList.contains('dark'))
+    update()
+    const observer = new MutationObserver(update)
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+  return isDark
+}
+
 export function MermaidBlock({ chart }: { chart: string }) {
   const containerRef = React.useRef<HTMLDivElement>(null)
   const idRef = React.useRef(`mermaid-${Math.random().toString(36).slice(2, 9)}`)
   const [svgContent, setSvgContent] = React.useState<string | null>(null)
+  const [failed, setFailed] = React.useState(false)
   const [fullscreen, setFullscreen] = React.useState(false)
+  const isDark = useIsDarkMode()
 
   React.useEffect(() => {
     let cancelled = false
+    setFailed(false)
     import('mermaid').then(({ default: mermaid }) => {
-      mermaid.initialize({ startOnLoad: false, theme: 'neutral' })
+      // Otherwise a parse failure also injects mermaid's error SVG into document.body.
+      mermaid.initialize({
+        startOnLoad: false,
+        suppressErrorRendering: true,
+        theme: isDark ? 'dark' : 'neutral',
+      })
       mermaid
         .render(idRef.current, chart)
         .then(({ svg }) => {
@@ -25,15 +46,24 @@ export function MermaidBlock({ chart }: { chart: string }) {
           }
         })
         .catch(() => {
-          if (!cancelled && containerRef.current) {
-            containerRef.current.textContent = chart
+          if (!cancelled) {
+            setSvgContent(null)
+            setFailed(true)
           }
         })
     })
     return () => {
       cancelled = true
     }
-  }, [chart])
+  }, [chart, isDark])
+
+  if (failed) {
+    return (
+      <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/60 p-4 text-[13px] leading-relaxed text-muted-foreground">
+        {chart}
+      </pre>
+    )
+  }
 
   return (
     <>

@@ -1,29 +1,42 @@
-"""Reference parsing and graph building.
+"""Parse wiki citations (`[^N]: file.pdf, p.3`) and links (`[text](path.md)`) into reference edges."""
 
-Parses wiki page content for footnote citations ([^N]: filename.pdf, p.3)
-and internal links ([text](path.md)), stores edges in document_references.
-"""
-
-import re
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
-_CITATION_RE = re.compile(r"\[\^\d+\]:\s*(.+)$", re.MULTILINE)
+# Use [ \t]* rather than \s*: \s matches newlines, so an *inline* footnote
+# reference ending a line before a colon -- "**Mechanics agreed**[^smurfit]:" --
+# would consume the newline and read the FOLLOWING line as the citation target.
+# Anchored at line start (≤3 spaces, as in CommonMark): a mid-line "claim[^x]: more text"
+# is an inline reference followed by a colon, not a definition.
+# Keep in sync with mcp/tools/references.py (separate import roots).
+_CITATION_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:[ \t]*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
+
+_KNOWN_EXT = r"(?:pdf|docx?|pptx?|xlsx?|csv|html?|md|txt|png|jpe?g|gif|webp|svg|canvas)"
 
 
 def parse_citation_filename(raw: str) -> tuple[str, int | None]:
-    """Extract filename and optional page from a citation like 'paper.pdf, p.3'."""
+    """Extract filename and optional page from a citation like 'paper.pdf, p.3'.
+
+    The filename is anchored on a known file extension so names that contain
+    hyphens (e.g. '2026-06-23 - Meeting Notes.md') are not truncated. Any
+    trailing annotation (", p.3", " — note", " (source)", ", §2.3") is dropped.
+    """
     raw = raw.strip().lstrip("*").rstrip("*")
-    link_match = re.match(r"\[([^\]]+)\]\([^)]*\)", raw)
+    link_match = re.match(r"\[([^\]]+)\]\([^)]*\)(.*)$", raw)
     if link_match:
-        raw = link_match.group(1)
-    parts = re.match(r"^(.+?)(?:,\s*p\.?\s*(\d+))?(?:\s*[-–—].*)?$", raw)
-    if not parts:
-        return raw, None
-    filename = parts.group(1).strip()
-    page = int(parts.group(2)) if parts.group(2) else None
+        raw = f"{link_match.group(1)}{link_match.group(2)}"
+    page = None
+    page_match = re.search(r",\s*p\.?\s*(\d+)", raw)
+    if page_match:
+        page = int(page_match.group(1))
+    ext_match = re.search(rf"^(.+\.{_KNOWN_EXT})\b", raw, re.IGNORECASE)
+    if ext_match:
+        filename = ext_match.group(1).strip()
+    else:
+        filename = re.split(r",|\s[-–—]\s", raw, maxsplit=1)[0].strip()
     return filename, page
 
 
@@ -93,14 +106,10 @@ def extract_references(
     base_to_doc: dict[str, dict],
     wiki_path_to_doc: dict[str, dict],
 ) -> list[dict]:
-    """Parse content and return a list of reference edges.
-
-    Each edge is: {"target_id": str, "type": "cites"|"links_to", "page": int|None}
-    """
+    """Return edges as {"target_id": str, "type": "cites"|"links_to", "page": int|None}."""
     edges: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
-    # Footnote citations: [^N]: filename.pdf, p.3
     for match in _CITATION_RE.finditer(content):
         filename, page = parse_citation_filename(match.group(1))
         fn_lower = filename.lower()
@@ -114,7 +123,6 @@ def extract_references(
                 seen.add(key)
                 edges.append({"target_id": target["id"], "type": "cites", "page": page})
 
-    # Wiki cross-references: [text](path.md)
     for link_path in parse_wiki_links(content, wiki_dir):
         target = wiki_path_to_doc.get(link_path.lower())
         if not target:

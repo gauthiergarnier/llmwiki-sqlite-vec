@@ -1,30 +1,43 @@
 'use client'
 
 import * as React from 'react'
+import Link from 'next/link'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
-  ChevronRight, FileText, NotepadText, Library,
+  ChevronLeft, ChevronRight, FileText, NotepadText, Library,
   Upload, BookOpen, ArrowUpRight, Search as SearchIcon,
-  Lightbulb, Box, ScrollText, Network, Folder,
+  Lightbulb, Box, ScrollText, Network, Folder, Check, ListChecks, Lock, Plug,
+  PanelLeftClose, PanelLeftOpen, History,
 } from 'lucide-react'
 import {
   CommandDialog, CommandInput, CommandList, CommandItem,
   CommandEmpty, CommandGroup, CommandSeparator,
 } from '@/components/ui/command'
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { cn } from '@/lib/utils'
+import { cn, toDisplayTitle } from '@/lib/utils'
 import { WikiSelector } from '@/components/kb/WikiSelector'
 import { SidenavUserMenu } from '@/components/kb/SidenavUserMenu'
-import { apiFetch } from '@/lib/api'
-import { useUserStore } from '@/stores'
+import { openMcpConnectionDock } from '@/components/connections/McpConnectionDock'
 import type { DocumentListItem, WikiNode } from '@/lib/types'
 
-interface Usage {
-  total_pages: number
-  total_storage_bytes: number
-  document_count: number
-  max_pages: number
-  max_storage_bytes: number
+const SIDENAV_COLLAPSED_KEY = 'kb-sidenav-collapsed'
+const isLocal = process.env.NEXT_PUBLIC_MODE === 'local'
+
+// Restores the collapsed state before first paint (no expanded-rail flash) without SSR warnings.
+const useIsomorphicLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect
+
+// Only normalize all-lowercase names (file slugs); preserve intentional casing like "GRPO" or "LoRA".
+function withoutLegacyActivityPages(nodes: WikiNode[]): WikiNode[] {
+  const result: WikiNode[] = []
+  for (const node of nodes) {
+    const children = node.children ? withoutLegacyActivityPages(node.children) : undefined
+    const normalizedPath = node.path?.replace(/^\/wiki\/?/, '')
+    if (normalizedPath === 'log.md' || normalizedPath === 'index.json') {
+      if (children?.length) result.push({ ...node, path: undefined, docNumber: null, children })
+      continue
+    }
+    result.push({ ...node, children })
+  }
+  return result
 }
 
 
@@ -39,10 +52,15 @@ interface KBSidenavProps {
   loading: boolean
   onUpload: () => void
   filesViewActive: boolean
-  onFilesToggle: () => void
+  onOpenFiles: () => void
   graphViewActive: boolean
   onGraphToggle: () => void
   onOpenSourceDoc: (docId: string) => void
+  recentActive?: boolean
+  onRecentSelect?: () => void
+  courseMode?: boolean
+  courseCurrentPath?: string | null
+  courseProgress?: { completed: number; total: number }
 }
 
 export function KBSidenav({
@@ -56,12 +74,36 @@ export function KBSidenav({
   loading,
   onUpload,
   filesViewActive,
-  onFilesToggle,
+  onOpenFiles,
   graphViewActive,
   onGraphToggle,
   onOpenSourceDoc,
+  recentActive = false,
+  onRecentSelect,
+  courseMode = false,
+  courseCurrentPath = null,
+  courseProgress,
 }: KBSidenavProps) {
   const [searchOpen, setSearchOpen] = React.useState(false)
+  const searchTriggerRef = React.useRef<HTMLButtonElement>(null)
+  const collapsedSearchRef = React.useRef<HTMLButtonElement>(null)
+
+  const restoreSearchFocus = React.useCallback((event: Event) => {
+    event.preventDefault()
+    const target = searchTriggerRef.current ?? collapsedSearchRef.current
+    target?.focus()
+  }, [])
+  const [collapsed, setCollapsed] = React.useState(false)
+
+  useIsomorphicLayoutEffect(() => {
+    setCollapsed(localStorage.getItem(SIDENAV_COLLAPSED_KEY) === '1')
+  }, [])
+
+  const toggleCollapsed = () => {
+    const next = !collapsed
+    setCollapsed(next)
+    localStorage.setItem(SIDENAV_COLLAPSED_KEY, next ? '1' : '0')
+  }
 
   React.useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -77,6 +119,8 @@ export function KBSidenav({
   const isMac = React.useMemo(() =>
     typeof navigator !== 'undefined' && /Mac|iPod|iPhone|iPad/.test(navigator.userAgent),
   [])
+
+  const visibleWikiTree = React.useMemo(() => withoutLegacyActivityPages(wikiTree), [wikiTree])
 
   const allSearchableItems = React.useMemo(() => {
     const items: { type: 'wiki' | 'source'; title: string; keywords: string; tags: string[]; path?: string; docNumber?: number | null; doc?: DocumentListItem }[] = []
@@ -97,7 +141,7 @@ export function KBSidenav({
         if (node.children) addWikiNodes(node.children, node.title)
       }
     }
-    addWikiNodes(wikiTree)
+    addWikiNodes(visibleWikiTree)
     for (const doc of sourceDocs) {
       const tags = doc.tags ?? []
       items.push({
@@ -109,51 +153,138 @@ export function KBSidenav({
       })
     }
     return items
-  }, [wikiTree, sourceDocs])
+  }, [visibleWikiTree, sourceDocs])
 
   const sourceCount = sourceDocs.length
 
   return (
-    <div className="h-full flex flex-col border-r border-border">
-      {/* Wiki selector */}
-      <div className="shrink-0 px-2 pt-2 pb-1">
-        <WikiSelector kbId={kbId} kbName={kbName} />
-      </div>
+    <div
+      className={cn(
+        'h-full flex flex-col bg-sidebar border-r border-sidebar-border overflow-hidden transition-[width] duration-200',
+        collapsed ? 'w-12' : 'w-[272px]',
+      )}
+    >
+      {collapsed && (
+        <div className="flex flex-col items-center gap-1.5 pt-2">
+          <AllWikisLink className="size-8" />
+          <button
+            onClick={toggleCollapsed}
+            title="Expand sidebar"
+            className="flex items-center justify-center size-8 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors cursor-pointer"
+          >
+            <PanelLeftOpen className="size-3.5" />
+          </button>
+          <button
+            ref={collapsedSearchRef}
+            onClick={() => setSearchOpen(true)}
+            title="Search"
+            className="flex items-center justify-center size-8 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors cursor-pointer"
+          >
+            <SearchIcon className="size-3.5" />
+          </button>
+          {!courseMode && onRecentSelect && (
+            <button
+              onClick={onRecentSelect}
+              title="Recent changes"
+              aria-current={recentActive ? 'page' : undefined}
+              className={cn(
+                'flex size-8 cursor-pointer items-center justify-center rounded-md transition-colors',
+                recentActive
+                  ? 'bg-sidebar-accent text-foreground'
+                  : 'text-muted-foreground/50 hover:bg-sidebar-accent hover:text-muted-foreground',
+              )}
+            >
+              <History className="size-3.5" />
+            </button>
+          )}
+          {!courseMode && (
+            <>
+              <button
+                onClick={onGraphToggle}
+                title="Knowledge graph"
+                className={cn(
+                  'flex items-center justify-center size-8 rounded-md transition-colors cursor-pointer',
+                  graphViewActive
+                    ? 'bg-sidebar-accent text-foreground'
+                    : 'text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent',
+                )}
+              >
+                <Network className="size-3.5" />
+              </button>
+              <button
+                onClick={onUpload}
+                title="Upload files"
+                className="flex items-center justify-center size-8 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors cursor-pointer"
+              >
+                <Upload className="size-3.5" />
+              </button>
+            </>
+          )}
+        </div>
+      )}
 
-      {/* Search + Upload + Graph */}
+      {!collapsed && (
+        <>
+          <div className="shrink-0 px-2 pt-2 pb-2 flex items-center gap-1">
+            <AllWikisLink className="size-7 shrink-0" />
+            <div className="flex-1 min-w-0">
+              <WikiSelector kbId={kbId} kbName={kbName} />
+            </div>
+            <button
+              onClick={toggleCollapsed}
+              title="Collapse sidebar"
+              className="flex items-center justify-center size-7 shrink-0 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors cursor-pointer"
+            >
+              <PanelLeftClose className="size-3.5" />
+            </button>
+          </div>
+        </>
+      )}
+
+      {!collapsed && courseMode && courseProgress && courseProgress.total > 0 && (
+        <div className="shrink-0 px-3 pb-2 -mt-1 flex items-center gap-2">
+          <div className="flex-1 h-1 rounded-full bg-muted overflow-hidden">
+            <div
+              className="h-full bg-foreground/30 transition-[width]"
+              style={{ width: `${Math.round((courseProgress.completed / courseProgress.total) * 100)}%` }}
+            />
+          </div>
+          <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+            {courseProgress.completed}/{courseProgress.total}
+          </span>
+        </div>
+      )}
+
+      {!collapsed && (
       <div className="shrink-0 px-2 pb-1 flex items-center gap-1.5">
         <button
+          ref={searchTriggerRef}
           onClick={() => setSearchOpen(true)}
           aria-label="Search pages and sources"
-          className="flex items-center gap-2 flex-1 px-2.5 py-1.5 text-xs text-muted-foreground/50 hover:text-muted-foreground border border-border hover:bg-accent rounded-md transition-colors cursor-pointer"
+          className="flex items-center gap-2 flex-1 px-2.5 h-8 text-xs text-muted-foreground/50 hover:text-muted-foreground border border-border hover:bg-sidebar-accent rounded-md transition-colors cursor-pointer"
         >
           <SearchIcon className="size-3" />
           <span className="flex-1 text-left">Search</span>
           <kbd className="text-[10px] text-muted-foreground/30 bg-muted px-1 rounded">{isMac ? '⌘K' : 'Ctrl+K'}</kbd>
         </button>
-        <button
-          onClick={onGraphToggle}
-          className={cn(
-            'flex items-center justify-center px-2.5 py-1.5 border rounded-md transition-colors cursor-pointer',
-            graphViewActive
-              ? 'bg-accent text-foreground border-border'
-              : 'text-muted-foreground/50 hover:text-muted-foreground border-border hover:bg-accent',
-          )}
-          title="Knowledge graph"
-        >
-          <Network className="size-3" />
-        </button>
-        <button
-          onClick={onUpload}
-          className="flex items-center justify-center px-2.5 py-1.5 text-muted-foreground/50 hover:text-muted-foreground border border-border hover:bg-accent rounded-md transition-colors cursor-pointer"
-          title="Upload files"
-        >
-          <Upload className="size-3" />
-        </button>
+        {!courseMode && (
+          <button
+            onClick={onGraphToggle}
+            className={cn(
+              'flex items-center justify-center size-8 shrink-0 border rounded-md transition-colors cursor-pointer',
+              graphViewActive
+                ? 'bg-sidebar-accent text-foreground border-border'
+                : 'text-muted-foreground/50 hover:text-muted-foreground border-border hover:bg-sidebar-accent',
+            )}
+            title="Knowledge graph"
+          >
+            <Network className="size-3" />
+          </button>
+        )}
       </div>
+      )}
 
-      {/* Search palette */}
-      <CommandDialog open={searchOpen} onOpenChange={setSearchOpen}>
+      <CommandDialog open={searchOpen} onOpenChange={setSearchOpen} onCloseAutoFocus={restoreSearchFocus}>
         <CommandInput placeholder="Jump to page, source, or action..." aria-label="Search pages and sources" />
         <CommandList>
           <CommandEmpty>No results found.</CommandEmpty>
@@ -170,7 +301,7 @@ export function KBSidenav({
                   className="flex items-center"
                 >
                   <FileText className="size-3.5 mr-2 opacity-50 shrink-0" />
-                  <span className="truncate">{item.title}</span>
+                  <span className="truncate">{toDisplayTitle(item.title)}</span>
                   {item.tags.length > 0 && (
                     <span className="ml-auto flex items-center gap-1 shrink-0 pl-2">
                       {item.tags.slice(0, 3).map((tag) => (
@@ -213,80 +344,155 @@ export function KBSidenav({
           )}
           <CommandSeparator />
           <CommandGroup heading="Actions">
-            <CommandItem onSelect={() => { setSearchOpen(false); onFilesToggle() }}>
+            {!courseMode && onRecentSelect && (
+              <CommandItem onSelect={() => { setSearchOpen(false); onRecentSelect() }}>
+                <History className="size-3.5 mr-2 opacity-50" />
+                Recent changes
+              </CommandItem>
+            )}
+            {!isLocal && (
+              <CommandItem onSelect={() => { setSearchOpen(false); openMcpConnectionDock() }}>
+                <Plug className="size-3.5 mr-2 opacity-50" />
+                Connect AI
+              </CommandItem>
+            )}
+            <CommandItem onSelect={() => { setSearchOpen(false); onOpenFiles() }}>
               <Folder className="size-3.5 mr-2 opacity-50" />
-              Browse Files
+              Browse files
             </CommandItem>
             <CommandItem onSelect={() => { setSearchOpen(false); onUpload() }}>
               <Upload className="size-3.5 mr-2 opacity-50" />
-              Upload Files
+              Upload files
             </CommandItem>
           </CommandGroup>
         </CommandList>
       </CommandDialog>
 
-      {/* Wiki tree */}
-      <div className="flex-1 min-h-0 flex flex-col px-2 pt-1">
-        <div className="flex items-center px-2 mb-1 shrink-0">
-          <span className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50">
-            Wiki
-          </span>
+      {!collapsed && !courseMode && onRecentSelect && (
+        <div className="shrink-0 px-2 pb-1 pt-1">
+          <button
+            type="button"
+            onClick={onRecentSelect}
+            aria-current={recentActive ? 'page' : undefined}
+            className={cn(
+              'flex w-full cursor-pointer items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors',
+              recentActive
+                ? 'bg-sidebar-accent font-medium text-foreground'
+                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground',
+            )}
+          >
+            <History className="size-3 shrink-0 opacity-60" />
+            <span className="truncate">Recent</span>
+          </button>
         </div>
+      )}
+
+      {!collapsed && (
+      <>
+      <div className="flex-1 min-h-0 overflow-y-auto no-scrollbar px-2 pt-1.5">
         {loading ? (
           <SidenavSkeleton lines={3} />
         ) : hasWiki ? (
-          <div className="flex-1 overflow-y-auto no-scrollbar">
-            {wikiTree.map((node, i) => (
-              <WikiTreeNode
+          visibleWikiTree.map((node, i) =>
+            node.children && node.children.length > 0 ? (
+              <WikiSection
                 key={node.path ?? node.title ?? i}
                 node={node}
-                depth={0}
                 activePath={wikiActivePath}
                 onNavigate={onWikiNavigate}
+                courseMode={courseMode}
+                currentPath={courseCurrentPath}
               />
-            ))}
-          </div>
+            ) : (
+              <WikiLeaf
+                key={node.path ?? node.title ?? i}
+                node={node}
+                activePath={wikiActivePath}
+                onNavigate={onWikiNavigate}
+                courseMode={courseMode}
+                currentPath={courseCurrentPath}
+              />
+            ),
+          )
         ) : (
           <div className="px-2 py-4 text-center">
             <BookOpen className="size-6 text-muted-foreground/20 mx-auto mb-2" />
             <p className="text-xs text-muted-foreground mb-2">No wiki yet</p>
-            <a
-              href="https://claude.ai"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Open Claude
-              <ArrowUpRight className="size-3" />
-            </a>
+            {isLocal ? (
+              <a
+                href="https://claude.ai"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                Open Claude
+                <ArrowUpRight className="size-3" />
+              </a>
+            ) : (
+              <button
+                type="button"
+                onClick={openMcpConnectionDock}
+                className="inline-flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              >
+                Connect AI
+                <Plug className="size-3" />
+              </button>
+            )}
           </div>
         )}
       </div>
 
-      {/* Sources button — separated from passive info below */}
       <div className="shrink-0 px-2 pb-1">
-        <button
-          onClick={onFilesToggle}
-          className={cn(
-            'flex items-center gap-2 w-full px-2.5 py-2 text-[13px] rounded-md transition-colors cursor-pointer',
-            filesViewActive
-              ? 'bg-accent text-foreground font-medium'
-              : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+        <div className="flex items-center gap-1">
+          <button
+            onClick={onOpenFiles}
+            className={cn(
+              'flex items-center gap-2 flex-1 min-w-0 px-2.5 py-2 text-[13px] rounded-md transition-colors cursor-pointer',
+              filesViewActive
+                ? 'bg-sidebar-accent text-foreground font-medium'
+                : 'text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/60',
+            )}
+          >
+            <Library className="size-3.5" />
+            <span className="flex-1 text-left">Sources</span>
+            {sourceCount > 0 && (
+              <span className="text-[10px] text-muted-foreground/30">{sourceCount}</span>
+            )}
+          </button>
+          {!courseMode && (
+            <button
+              onClick={onUpload}
+              title="Upload files"
+              className="flex items-center justify-center size-7 shrink-0 rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors cursor-pointer"
+            >
+              <Upload className="size-3.5" />
+            </button>
           )}
-        >
-          <Library className="size-3.5" />
-          <span className="flex-1 text-left">Sources</span>
-          {sourceCount > 0 && (
-            <span className="text-[10px] text-muted-foreground/30">{sourceCount}</span>
-          )}
-        </button>
+        </div>
       </div>
 
-      {/* User menu */}
       <div className="shrink-0 border-t border-border p-2">
         <SidenavUserMenu />
       </div>
+      </>
+      )}
     </div>
+  )
+}
+
+function AllWikisLink({ className }: { className: string }) {
+  return (
+    <Link
+      href="/wikis"
+      title="All wikis"
+      aria-label="All wikis"
+      className={cn(
+        'flex items-center justify-center rounded-md text-muted-foreground/50 hover:text-muted-foreground hover:bg-sidebar-accent transition-colors',
+        className,
+      )}
+    >
+      <ChevronLeft className="size-3.5" />
+    </Link>
   )
 }
 
@@ -297,7 +503,7 @@ function SidenavSkeleton({ lines }: { lines: number }) {
         <div
           key={i}
           className="h-5 rounded-md bg-muted/50 animate-pulse"
-          style={{ width: `${60 + Math.random() * 30}%` }}
+          style={{ width: `${60 + ((i * 13) % 3) * 10}%` }}
         />
       ))}
     </div>
@@ -312,6 +518,8 @@ function wikiNodeIcon(node: WikiNode, depth: number) {
     return <BookOpen className="size-3 shrink-0 opacity-60" />
   if (slug === 'log' || (depth === 0 && titleLower === 'log'))
     return <ScrollText className="size-3 shrink-0 opacity-60" />
+  if (slug === 'plan' || (depth === 0 && titleLower === 'plan'))
+    return <ListChecks className="size-3 shrink-0 opacity-60" />
   if (slug === 'concepts' || (depth === 0 && titleLower === 'concepts'))
     return <Lightbulb className="size-3 shrink-0 opacity-60" />
   if (slug === 'entities' || (depth === 0 && titleLower === 'entities'))
@@ -323,32 +531,205 @@ function wikiNodeIcon(node: WikiNode, depth: number) {
   return <FileText className="size-3 shrink-0 opacity-50" />
 }
 
+// `current` beats `locked`: the page you're on never shows a lock.
+function CourseGlyph({ node, current }: { node: WikiNode; current: boolean }) {
+  if (node.status === 'complete') return <Check className="size-3.5 text-emerald-500" />
+  if (current) return <span className="size-1.5 rounded-full bg-foreground" />
+  if (node.locked) return <Lock className="size-3 text-muted-foreground/40" />
+  return <span className="size-2.5 rounded-full border border-border" />
+}
+
+function WikiLeaf({
+  node,
+  activePath,
+  onNavigate,
+  courseMode = false,
+  currentPath = null,
+}: {
+  node: WikiNode
+  activePath: string | null
+  onNavigate: (path: string, docNumber?: number | null) => void
+  courseMode?: boolean
+  currentPath?: string | null
+}) {
+  const isActive = node.path != null && node.path === activePath
+  const locked = courseMode && !!node.locked && !isActive
+  return (
+    <button
+      onClick={() => { if (node.path) onNavigate(node.path, node.docNumber) }}
+      title={locked ? 'Ahead of your current lesson' : undefined}
+      className={cn(
+        'flex items-center gap-2.5 w-full text-left text-[13px] rounded-md px-2 py-1.5 transition-colors cursor-pointer',
+        locked
+          ? 'text-muted-foreground/40 hover:text-muted-foreground'
+          : isActive ? 'bg-sidebar-accent text-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/60',
+      )}
+    >
+      {courseMode
+        ? <span className="grid place-items-center size-4 shrink-0"><CourseGlyph node={node} current={node.path === currentPath || isActive} /></span>
+        : wikiNodeIcon(node, 0)}
+      <span className="truncate flex-1 min-w-0">{toDisplayTitle(node.title)}</span>
+    </button>
+  )
+}
+
+function WikiSectionItem({
+  node,
+  activePath,
+  onNavigate,
+  courseMode = false,
+  currentPath = null,
+}: {
+  node: WikiNode
+  activePath: string | null
+  onNavigate: (path: string, docNumber?: number | null) => void
+  courseMode?: boolean
+  currentPath?: string | null
+}) {
+  const isActive = node.path != null && node.path === activePath
+  const locked = courseMode && !!node.locked && !isActive
+  return (
+    <button
+      onClick={() => { if (node.path) onNavigate(node.path, node.docNumber) }}
+      title={locked ? 'Ahead of your current lesson' : undefined}
+      className={cn(
+        'relative block w-full text-left text-[13px] rounded-md pl-8 pr-2 py-1.5 truncate transition-colors cursor-pointer',
+        locked
+          ? 'text-muted-foreground/40 hover:text-muted-foreground'
+          : isActive ? 'bg-sidebar-accent text-foreground font-medium' : 'text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/60',
+      )}
+    >
+      {courseMode && (
+        <span className="absolute left-[7px] top-1/2 -translate-y-1/2 grid place-items-center size-4 rounded-full bg-sidebar">
+          <CourseGlyph node={node} current={node.path === currentPath || isActive} />
+        </span>
+      )}
+      {toDisplayTitle(node.title)}
+    </button>
+  )
+}
+
+function nodeContainsPath(node: WikiNode, activePath: string | null): boolean {
+  if (activePath == null) return false
+  if (node.path === activePath) return true
+  return (node.children ?? []).some((c) => nodeContainsPath(c, activePath))
+}
+
+function WikiSection({
+  node,
+  activePath,
+  onNavigate,
+  courseMode = false,
+  currentPath = null,
+}: {
+  node: WikiNode
+  activePath: string | null
+  onNavigate: (path: string, docNumber?: number | null) => void
+  courseMode?: boolean
+  currentPath?: string | null
+}) {
+  const hasActiveChild = (node.children ?? []).some((c) => nodeContainsPath(c, activePath))
+  const [expanded, setExpanded] = React.useState(true)
+
+  React.useEffect(() => {
+    if (hasActiveChild) setExpanded(true)
+  }, [hasActiveChild])
+
+  return (
+    <div className="mt-3 first:mt-0">
+      <button
+        onClick={() => setExpanded((prev) => !prev)}
+        className="group w-full flex items-center gap-1 px-2 h-6 cursor-pointer"
+      >
+        <ChevronRight
+          className={cn(
+            'size-3 shrink-0 text-muted-foreground/30 group-hover:text-muted-foreground/60 transition-transform duration-150',
+            expanded && 'rotate-90',
+          )}
+        />
+        <span className="truncate text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/50 group-hover:text-muted-foreground/70 transition-colors">
+          {toDisplayTitle(node.title)}
+        </span>
+      </button>
+      <AnimatePresence initial={false}>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: 'auto', opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15, ease: [0.25, 0.1, 0.25, 1] }}
+            style={{ overflow: 'hidden' }}
+          >
+            <div className="relative mt-0.5">
+              <div className="absolute left-[15px] top-1 bottom-1 w-px bg-border" aria-hidden />
+              {node.children!.map((child, i) =>
+                child.children && child.children.length > 0 ? (
+                  <WikiTreeNode
+                    key={child.path ?? child.title ?? i}
+                    node={child}
+                    depth={1}
+                    activePath={activePath}
+                    onNavigate={onNavigate}
+                    courseMode={courseMode}
+                    currentPath={currentPath}
+                  />
+                ) : (
+                  <WikiSectionItem
+                    key={child.path ?? child.title ?? i}
+                    node={child}
+                    activePath={activePath}
+                    onNavigate={onNavigate}
+                    courseMode={courseMode}
+                    currentPath={currentPath}
+                  />
+                ),
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  )
+}
+
 function WikiTreeNode({
   node,
   depth,
   activePath,
   onNavigate,
+  courseMode = false,
+  currentPath = null,
 }: {
   node: WikiNode
   depth: number
   activePath: string | null
   onNavigate: (path: string, docNumber?: number | null) => void
+  courseMode?: boolean
+  currentPath?: string | null
 }) {
   const hasChildren = node.children && node.children.length > 0
   const isActive = node.path != null && node.path === activePath
   const hasActiveChild = hasChildren && node.children!.some((c) => c.path === activePath)
+  const locked = courseMode && !!node.locked && !isActive
   const [expanded, setExpanded] = React.useState(true)
+
+  React.useEffect(() => {
+    if (hasActiveChild) setExpanded(true)
+  }, [hasActiveChild])
 
   return (
     <div>
       <div
         className={cn(
           'flex items-center gap-1.5 w-full text-left text-[13px] rounded-md px-2 py-1.5 transition-colors cursor-pointer',
-          isActive
-            ? 'bg-accent text-foreground font-medium'
-            : 'text-muted-foreground hover:text-foreground hover:bg-accent/50',
+          locked
+            ? 'text-muted-foreground/40 hover:text-muted-foreground'
+            : isActive
+              ? 'bg-sidebar-accent text-foreground font-medium'
+              : 'text-muted-foreground hover:text-foreground hover:bg-sidebar-accent/60',
         )}
         style={{ paddingLeft: `${depth * 12 + 8}px` }}
+        title={locked ? 'Ahead of your current lesson' : undefined}
         onClick={() => {
           if (node.path) {
             onNavigate(node.path, node.docNumber)
@@ -373,11 +754,13 @@ function WikiTreeNode({
         ) : (
           <span className="w-3.5" />
         )}
-        {wikiNodeIcon(node, depth)}
-        <span className="truncate flex-1 min-w-0">{node.title}</span>
+        {courseMode && node.path
+          ? <span className="grid place-items-center size-4 shrink-0"><CourseGlyph node={node} current={node.path === currentPath || isActive} /></span>
+          : wikiNodeIcon(node, depth)}
+        <span className="truncate flex-1 min-w-0">{toDisplayTitle(node.title)}</span>
       </div>
       <AnimatePresence initial={false}>
-        {hasChildren && (expanded || hasActiveChild) && (
+        {hasChildren && expanded && (
           <motion.div
             initial={{ height: 0, opacity: 0 }}
             animate={{ height: 'auto', opacity: 1 }}
@@ -393,6 +776,8 @@ function WikiTreeNode({
                 depth={depth + 1}
                 activePath={activePath}
                 onNavigate={onNavigate}
+                courseMode={courseMode}
+                currentPath={currentPath}
               />
             ))}
           </motion.div>
@@ -401,76 +786,3 @@ function WikiTreeNode({
     </div>
   )
 }
-
-
-function PageUsageBar() {
-  const token = useUserStore((s) => s.accessToken)
-  const [usage, setUsage] = React.useState<Usage | null>(null)
-  const [modalOpen, setModalOpen] = React.useState(false)
-
-  React.useEffect(() => {
-    if (!token) return
-    apiFetch<Usage>('/v1/usage', token)
-      .then(setUsage)
-      .catch(() => {})
-  }, [token])
-
-  if (!usage) return null
-
-  const pct = Math.min(100, (usage.total_pages / usage.max_pages) * 100)
-  const color =
-    pct > 90 ? 'bg-destructive' : pct > 70 ? 'bg-yellow-500' : 'bg-primary'
-
-  return (
-    <>
-      <button
-        onClick={() => setModalOpen(true)}
-        className="flex items-center gap-2 w-full px-2 py-1 rounded-md hover:bg-accent transition-colors cursor-pointer group"
-      >
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center justify-between mb-0.5">
-            <span className="text-[10px] text-muted-foreground/60 group-hover:text-muted-foreground transition-colors">
-              Pages
-            </span>
-            <span className="text-[10px] font-mono text-muted-foreground/40 group-hover:text-muted-foreground/60 transition-colors">
-              {usage.total_pages} / {usage.max_pages}
-            </span>
-          </div>
-          <div className="h-1 rounded-full bg-muted overflow-hidden">
-            <div
-              className={cn('h-full rounded-full transition-all', color)}
-              style={{ width: `${pct}%` }}
-            />
-          </div>
-        </div>
-      </button>
-
-      <Dialog open={modalOpen} onOpenChange={setModalOpen}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Page Usage</DialogTitle>
-          </DialogHeader>
-          <div className="space-y-3 text-sm text-muted-foreground">
-            <p>
-              You've used <span className="font-medium text-foreground">{usage.total_pages.toLocaleString()}</span> of
-              your <span className="font-medium text-foreground">{usage.max_pages.toLocaleString()}</span> page limit.
-            </p>
-            <div className="h-2 rounded-full bg-muted overflow-hidden">
-              <div
-                className={cn('h-full rounded-full transition-all', color)}
-                style={{ width: `${pct}%` }}
-              />
-            </div>
-            <p>
-              Each PDF or office document consumes pages based on its length. Notes and wiki pages are free and unlimited.
-            </p>
-            <p className="text-xs text-muted-foreground/60">
-              Individual documents are limited to 300 pages. Need more capacity? Contact us.
-            </p>
-          </div>
-        </DialogContent>
-      </Dialog>
-    </>
-  )
-}
-

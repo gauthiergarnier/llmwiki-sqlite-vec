@@ -25,13 +25,17 @@ function Command({
 
 function CommandDialog({
   children,
+  onCloseAutoFocus,
   ...props
-}: React.ComponentProps<typeof Dialog>) {
+}: React.ComponentProps<typeof Dialog> & {
+  onCloseAutoFocus?: (event: Event) => void
+}) {
   return (
     <Dialog {...props}>
       <DialogPortal>
         <DialogOverlay />
         <DialogPrimitive.Content
+          onCloseAutoFocus={onCloseAutoFocus}
           className={cn(
             "fixed z-50 w-full max-w-lg rounded-xl border bg-popover shadow-2xl",
             "left-1/2 top-[20%] -translate-x-1/2",

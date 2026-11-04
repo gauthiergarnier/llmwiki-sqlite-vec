@@ -73,6 +73,14 @@ class TestParsePageRange:
         from tools.helpers import parse_page_range
         assert parse_page_range("abc,2,xyz", 10) == [2]
 
+    def test_malformed_range_does_not_crash(self):
+        from tools.helpers import parse_page_range
+        # An LLM emitting "5-" (page 5 onward) or "-5" (up to 5) must not raise.
+        assert parse_page_range("1-", 10) == []
+        assert parse_page_range("-5", 10) == []
+        assert parse_page_range("1-x", 10) == []
+        assert parse_page_range("2-4,9-", 10) == [2, 3, 4]
+
     def test_mixed(self):
         from tools.helpers import parse_page_range
         assert parse_page_range("1-3,7,5-6", 10) == [1, 2, 3, 5, 6, 7]
@@ -93,10 +101,22 @@ class TestCitationParsing:
         name, _ = _parse_citation_filename("[Paper Title](http://example.com)")
         assert name == "Paper Title"
 
+    def test_markdown_link_keeps_page_suffix(self):
+        from tools.references import _parse_citation_filename
+        name, page = _parse_citation_filename("[paper.pdf](http://example.com), p.7")
+        assert name == "paper.pdf"
+        assert page == 7
+
     def test_strips_trailing_dash_text(self):
         from tools.references import _parse_citation_filename
         name, page = _parse_citation_filename("paper.pdf, p.5 — section on scaling")
         assert name == "paper.pdf"
+        assert page == 5
+
+    def test_preserves_hyphenated_version_suffix(self):
+        from tools.references import _parse_citation_filename
+        name, page = _parse_citation_filename("2501.12948v2-2.pdf, p.5")
+        assert name == "2501.12948v2-2.pdf"
         assert page == 5
 
     def test_strips_em_dash(self):
@@ -156,3 +176,59 @@ class TestWikiLinkParsing:
         from tools.references import _parse_wiki_links
         links = _parse_wiki_links("[Img](data:image/png;base64,abc)", "")
         assert links == []
+
+
+@pytest.mark.asyncio
+async def test_read_webclip_returns_asset_images_when_requested():
+    from tools.read import ReadHandler
+
+    class FakeFS:
+        async def get_document(self, kb_id, filename, dir_path):
+            return {
+                "id": "doc-1",
+                "filename": filename,
+                "title": "Clip",
+                "path": dir_path,
+                "content": "Body ![Hero](./clip.assets/image-01.webp)",
+                "tags": [],
+                "version": 1,
+                "file_type": "md",
+                "metadata": {
+                    "assets": [
+                        {
+                            "document_id": "asset-1",
+                            "filename": "image-01.webp",
+                            "content_type": "image/webp",
+                            "file_type": "webp",
+                            "alt": "Hero",
+                        }
+                    ]
+                },
+            }
+
+        async def find_document_by_name(self, kb_id, name):
+            return None
+
+        async def get_document_metadata(self, kb_id, filename, dir_path):
+            return await self.get_document(kb_id, filename, dir_path)
+
+        async def find_document_metadata_by_name(self, kb_id, name):
+            return None
+
+        async def load_asset_bytes(self, asset_doc_id):
+            assert asset_doc_id == "asset-1"
+            return b"webp-bytes"
+
+        async def get_backlinks(self, doc_id):
+            return []
+
+    handler = ReadHandler(FakeFS(), {"id": "kb-1", "slug": "kb"})
+
+    result = await handler.read("clip.md", pages="", sections=None, include_images=True)
+
+    assert isinstance(result, list)
+    assert result[0].type == "text"
+    assert result[1].type == "text"
+    assert "Hero" in result[1].text
+    assert result[2].type == "image"
+    assert result[2].mimeType == "image/webp"

@@ -23,16 +23,28 @@ class KBService(ABC):
     async def list(self) -> list[dict]: ...
 
     @abstractmethod
-    async def get(self, kb_id: str) -> dict | None: ...
+    async def create(self, name: str, description: str | None, kind: str | None = None) -> dict: ...
 
     @abstractmethod
-    async def create(self, name: str, description: str | None) -> dict: ...
+    async def update(self, kb_id: str, name: str | None, description: str | None, kind: str | None = None) -> dict | None: ...
 
     @abstractmethod
-    async def update(self, kb_id: str, name: str | None, description: str | None) -> dict | None: ...
+    async def update_sharing(
+        self, kb_id: str, visibility: str, public_slug: str | None,
+    ) -> dict | None: ...
 
     @abstractmethod
     async def delete(self, kb_id: str) -> bool: ...
+
+
+class PublicWikiService(ABC):
+    """Anonymous read-only access. Implementations hardcode visibility = 'public'."""
+
+    @abstractmethod
+    async def get_by_slug(self, slug: str) -> dict | None: ...
+
+    @abstractmethod
+    async def get_asset_key(self, slug: str, document_number: int) -> str | None: ...
 
 
 class DocumentService(ABC):
@@ -51,6 +63,30 @@ class DocumentService(ABC):
 
     @abstractmethod
     async def create_note(self, kb_id: str, filename: str, path: str, content: str) -> dict: ...
+
+    @abstractmethod
+    async def create_web_clip(
+        self, kb_id: str, url: str, title: str, html: str,
+        highlights: list[dict] | None = None, path: str = "/webclipper/",
+    ) -> dict: ...
+
+    @abstractmethod
+    async def get_by_source_url(self, url: str) -> dict | None: ...
+
+    @abstractmethod
+    async def get_highlights(self, doc_id: str) -> dict | None: ...
+
+    @abstractmethod
+    async def upsert_highlight(
+        self, doc_id: str, highlight: dict,
+        expected_version: int | None = None,
+    ) -> dict | None: ...
+
+    @abstractmethod
+    async def delete_highlight(
+        self, doc_id: str, highlight_id: str,
+        expected_version: int | None = None,
+    ) -> dict | None: ...
 
     @abstractmethod
     async def update_content(self, doc_id: str, content: str) -> dict | None: ...
@@ -75,3 +111,6 @@ class ServiceFactory(ABC):
 
     @abstractmethod
     def document_service(self, user_id: str) -> DocumentService: ...
+
+    @abstractmethod
+    def public_wiki_service(self) -> PublicWikiService: ...

@@ -1,6 +1,5 @@
-"""Integration tests for knowledge base CRUD lifecycle."""
-
 import pytest
+from config import settings
 
 from tests.helpers.jwt import auth_headers
 
@@ -34,44 +33,53 @@ class TestCreateKB:
 
         kb_id = data["id"]
         docs = await pool.fetch(
-            "SELECT filename, path, title FROM documents WHERE knowledge_base_id = $1 ORDER BY filename",
+            "SELECT filename, path, title, content, tags, date FROM documents "
+            "WHERE knowledge_base_id = $1 ORDER BY filename",
             kb_id,
         )
         filenames = [d["filename"] for d in docs]
-        assert "log.md" in filenames
+        assert "log.md" not in filenames
         assert "overview.md" in filenames
+        overview = next(d for d in docs if d["filename"] == "overview.md")
+        assert overview["content"].startswith("---\n")
+        assert overview["tags"] == ["overview", "wiki"]
+        assert overview["date"]
 
-    async def test_duplicate_name_rejected(self, client):
+    async def test_duplicate_name_is_auto_suffixed(self, client):
         headers = auth_headers(USER_ID)
-        resp1 = await client.post(
-            "/v1/knowledge-bases", headers=headers,
-            json={"name": "Duplicate"},
-        )
+        resp1 = await client.post("/v1/knowledge-bases", headers=headers, json={"name": "Duplicate"})
+        resp2 = await client.post("/v1/knowledge-bases", headers=headers, json={"name": "Duplicate"})
+
         assert resp1.status_code == 201
+        assert resp2.status_code == 201
+        assert resp2.json()["name"] == "Duplicate (2)"
+        assert resp2.json()["slug"] != resp1.json()["slug"]
 
-        import asyncpg
-        with pytest.raises((asyncpg.UniqueViolationError, Exception)):
-            await client.post(
-                "/v1/knowledge-bases", headers=headers,
-                json={"name": "Duplicate"},
-            )
+    async def test_rename_keeps_slug_when_it_would_not_change(self, client):
+        headers = auth_headers(USER_ID)
+        kb = (await client.post("/v1/knowledge-bases", headers=headers, json={"name": "My Wiki"})).json()
 
-    async def test_global_user_cap_enforced(self, client):
-        import os
-        old = os.environ.get("GLOBAL_MAX_USERS")
-        os.environ["GLOBAL_MAX_USERS"] = "0"
-        try:
-            from config import Settings
-            # Config is cached at import, so this tests the DB check path
-            # The actual check is: SELECT COUNT(DISTINCT id) FROM users >= GLOBAL_MAX_USERS
-            # Since we have 1 user and cap is set via env, this may not take effect
-            # due to Settings being cached. This is a known limitation.
-            pass
-        finally:
-            if old:
-                os.environ["GLOBAL_MAX_USERS"] = old
-            else:
-                os.environ.pop("GLOBAL_MAX_USERS", None)
+        resp = await client.patch(f"/v1/knowledge-bases/{kb['id']}", headers=headers, json={"name": "My wiki"})
+
+        assert resp.status_code == 200
+        assert resp.json()["slug"] == kb["slug"]
+
+    async def test_rename_to_an_existing_name_is_409(self, client):
+        headers = auth_headers(USER_ID)
+        await client.post("/v1/knowledge-bases", headers=headers, json={"name": "Taken"})
+        other = (await client.post("/v1/knowledge-bases", headers=headers, json={"name": "Other"})).json()
+
+        resp = await client.patch(f"/v1/knowledge-bases/{other['id']}", headers=headers, json={"name": "Taken"})
+
+        assert resp.status_code == 409
+
+    async def test_global_user_cap_enforced(self, client, pool, monkeypatch):
+        monkeypatch.setattr(settings, "GLOBAL_MAX_USERS", 1)
+
+        resp = await client.post("/v1/knowledge-bases", headers=auth_headers(USER_ID), json={"name": "Over Cap"})
+
+        assert resp.status_code == 503
+        assert await pool.fetchval("SELECT COUNT(*) FROM knowledge_bases WHERE user_id = $1", USER_ID) == 0
 
 
 class TestListAndGetKB:
@@ -87,7 +95,7 @@ class TestListAndGetKB:
         assert "KB One" in names
         assert "KB Two" in names
 
-    async def test_get_includes_counts(self, client, pool):
+    async def test_list_includes_counts(self, client, pool):
         headers = auth_headers(USER_ID)
         create_resp = await client.post(
             "/v1/knowledge-bases", headers=headers,
@@ -95,13 +103,37 @@ class TestListAndGetKB:
         )
         kb_id = create_resp.json()["id"]
 
-        resp = await client.get(f"/v1/knowledge-bases/{kb_id}", headers=headers)
-        assert resp.status_code == 200
-        data = resp.json()
+        data = await listed_kb(client, headers, kb_id)
         assert "source_count" in data
         assert "wiki_page_count" in data
-        # Scaffold creates overview.md and log.md in /wiki/
-        assert data["wiki_page_count"] == 2
+        # Activity is database-backed; the only scaffolded page is Overview.
+        assert data["wiki_page_count"] == 1
+
+    async def test_lesson_counts_exclude_scaffold_and_track_completion(self, client, pool):
+        headers = auth_headers(USER_ID)
+        create_resp = await client.post(
+            "/v1/knowledge-bases", headers=headers,
+            json={"name": "A Course", "kind": "course"},
+        )
+        kb_id = create_resp.json()["id"]
+
+        await pool.execute(
+            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
+            "file_type, status, content, metadata) "
+            "VALUES ($1, $2, 'lesson-1.md', 'Lesson 1', '/wiki/', 'md', 'ready', 'x', "
+            "'{\"course\": {\"status\": \"complete\"}}'::jsonb)",
+            kb_id, USER_ID,
+        )
+        await pool.execute(
+            "INSERT INTO documents (knowledge_base_id, user_id, filename, title, path, "
+            "file_type, status, content) "
+            "VALUES ($1, $2, 'lesson-2.md', 'Lesson 2', '/wiki/', 'md', 'ready', 'x')",
+            kb_id, USER_ID,
+        )
+
+        data = await listed_kb(client, headers, kb_id)
+        assert data["lesson_count"] == 2
+        assert data["lessons_completed"] == 1
 
 
 class TestUpdateKB:
@@ -161,3 +193,9 @@ class TestDeleteKB:
             headers=auth_headers(USER_ID),
         )
         assert resp.status_code == 404
+
+
+async def listed_kb(client, headers: dict, kb_id: str) -> dict:
+    resp = await client.get("/v1/knowledge-bases", headers=headers)
+    assert resp.status_code == 200
+    return next(kb for kb in resp.json() if kb["id"] == kb_id)

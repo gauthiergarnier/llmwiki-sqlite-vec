@@ -1,20 +1,66 @@
 'use client'
 
 import * as React from 'react'
+import dynamic from 'next/dynamic'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import 'katex/dist/katex.min.css'
-import type { Components } from 'react-markdown'
+import type { Components, Options } from 'react-markdown'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { FileText, Copy, Download, Check, Network } from 'lucide-react'
-import { cn } from '@/lib/utils'
+import { FileText, Copy, Check, CircleAlert, Network, ChevronLeft, ChevronRight, ArrowRight, Trash2 } from 'lucide-react'
+import { cn, toDisplayTitle } from '@/lib/utils'
 import { apiFetch } from '@/lib/api'
+import { parsePlanTasks, type PlanSummary, type TaskStatus } from '@/lib/planTasks'
+import { decodeUnicodeEscapes } from '@/lib/text'
 import { useUserStore } from '@/stores'
-import { MermaidBlock } from './MermaidBlock'
 import { ExpandableMedia } from './DiagramViewer'
+import { WikiHighlighter } from './WikiHighlighter'
+import { WikiComments } from './WikiComments'
+import { useWikiHighlights } from '@/hooks/useWikiHighlights'
 import type { DocumentListItem } from '@/lib/types'
+
+// Fork: no single-$ inline math. Business wikis are full of prices ("$50k = $5k + …") that the
+// currency heuristic below can't reliably tell apart from LaTeX. Inline math uses $$…$$ or \( \).
+const REMARK_PLUGINS: Options['remarkPlugins'] = [
+  remarkGfm,
+  [remarkMath, { singleDollarTextMath: false }],
+  remarkFixOverescapedMath,
+  remarkTaskStatus,
+]
+const REHYPE_PLUGINS = [rehypeHeadingIds, rehypeKatex]
+
+const MermaidBlock = dynamic(() => import('./MermaidBlock').then((mod) => mod.MermaidBlock), {
+  ssr: false,
+  loading: () => (
+    <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/60 p-4 text-[13px] leading-relaxed">
+      Rendering diagram...
+    </pre>
+  ),
+})
+
+const QuizBlock = dynamic(() => import('./QuizBlock').then((mod) => mod.QuizBlock), {
+  ssr: false,
+  loading: () => (
+    <pre className="my-3 overflow-x-auto rounded-lg border border-border bg-muted/60 p-4 text-[13px] leading-relaxed">
+      Loading quiz...
+    </pre>
+  ),
+})
+
+// react-markdown hands `pre` a single <code> child whose className carries the fence language.
+function fenceInfo(child: React.ReactNode): { language: string; text: string } | null {
+  if (!React.isValidElement(child)) return null
+  const props = child.props
+  if (typeof props !== 'object' || props === null || !('className' in props)) return null
+  const className = (props as { className?: unknown }).className
+  if (typeof className !== 'string') return null
+  const match = className.match(/language-(\w+)/)
+  if (!match) return null
+  const text = 'children' in props ? String((props as { children?: unknown }).children).replace(/\n$/, '') : ''
+  return { language: match[1], text }
+}
 
 export interface TocItem {
   id: string
@@ -22,27 +68,37 @@ export interface TocItem {
   level: 2 | 3
 }
 
-function cleanHeadingText(raw: string): string {
-  return raw.replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
+function displayHeadingText(text: string): string {
+  return text.trim().toLowerCase() === 'checkpoint' ? 'Quiz' : text
+}
+
+// Strips only the legacy "Checkpoint" heading; the quiz fence stays byte-identical so question keys remain valid.
+export function stripLegacyQuizWrapper(md: string): string {
+  return md.replace(
+    /^#{2,3}[ \t]+Checkpoint[ \t]*\r?\n(?:[ \t]*\r?\n)*(?:Try to answer without looking back\.[ \t]*\r?\n(?:[ \t]*\r?\n)*)?(?=```quiz[ \t]*(?:\r?\n|$))/gim,
+    '',
+  )
 }
 
 export function extractTocFromMarkdown(md: string): TocItem[] {
   const items: TocItem[] = []
-  // Same dedupe sequence as the h1–h4 renderers, so TOC ids match DOM ids.
+  // Same slug sequence as rehypeHeadingIds (h1–h4, fences skipped) so TOC ids match DOM ids.
   const slug = createSlugger()
-  let inFence = false
+  let fence: string | null = null
   for (const line of md.split('\n')) {
-    if (/^\s*(```|~~~)/.test(line)) {
-      inFence = !inFence
+    const f = line.match(/^\s*(```|~~~)/)
+    if (f) {
+      if (fence === null) fence = f[1]
+      else if (f[1] === fence) fence = null
       continue
     }
-    if (inFence) continue
+    if (fence !== null) continue
     const m = line.match(/^(#{1,4})\s+(.+)/)
     if (!m) continue
     const level = m[1].length
-    const text = cleanHeadingText(m[2])
+    const text = m[2].replace(/\*\*/g, '').replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').trim()
     const id = slug(text)
-    if (level === 2 || level === 3) items.push({ id, text, level })
+    if (level === 2 || level === 3) items.push({ id, text: displayHeadingText(text), level })
   }
   return items
 }
@@ -56,107 +112,323 @@ function slugify(text: string): string {
     .replace(/^-|-$/g, '')
 }
 
-/** GitHub-style unique slugs: "foo", "foo-1", "foo-2", ... */
+/**
+ * GitHub-style unique slugs: "foo", "foo-1", "foo-2", ... Generated slugs are reserved
+ * too, so a third "Notes" can't collide with a heading literally titled "Notes 2".
+ */
 function createSlugger(): (text: string) => string {
-  const seen = new Map<string, number>()
+  const counts = new Map<string, number>()
+  const used = new Set<string>()
   return (text: string) => {
     const base = slugify(text)
-    const n = seen.get(base) ?? 0
-    seen.set(base, n + 1)
-    return n === 0 ? base : `${base}-${n}`
+    let n = counts.get(base) ?? 0
+    let slug = n === 0 ? base : `${base}-${n}`
+    while (used.has(slug)) {
+      n += 1
+      slug = `${base}-${n}`
+    }
+    counts.set(base, n + 1)
+    used.add(slug)
+    return slug
   }
 }
 
-function stripLeadingH1(content: string, title: string): string {
-  const trimmed = content.trimStart()
-  const match = trimmed.match(/^#\s+(.+)\n?/)
-  if (match) {
-    const h1Text = match[1].replace(/\*\*/g, '').trim()
-    const normalizedH1 = h1Text.toLowerCase().replace(/[^\w\s]/g, '').trim()
-    const normalizedTitle = title.toLowerCase().replace(/[^\w\s]/g, '').trim()
-    if (normalizedH1 === normalizedTitle) {
-      return trimmed.slice(match[0].length)
+interface HastLike {
+  type: string
+  tagName?: string
+  value?: string
+  properties?: Record<string, unknown>
+  children?: HastLike[]
+}
+
+function hastText(node: HastLike): string {
+  if (node.type === 'text') return node.value ?? ''
+  return (node.children ?? []).map(hastText).join('')
+}
+
+// Assigns unique heading ids in the tree itself (not at render time), so duplicate
+// headings get -1/-2 suffixes deterministically — React re-renders/StrictMode can't skew them.
+export function rehypeHeadingIds() {
+  return (tree: HastLike): void => {
+    const slug = createSlugger()
+    const visit = (node: HastLike): void => {
+      if (node.type === 'element' && /^h[1-4]$/.test(node.tagName ?? '')) {
+        const props = (node.properties ??= {})
+        // Leave ids set by other plugins alone (e.g. GFM's footnote-label).
+        if (props.id == null) props.id = slug(hastText(node).trim())
+        return
+      }
+      node.children?.forEach(visit)
     }
+    visit(tree)
   }
-  return content
+}
+
+const FRONTMATTER_RE = /^\s*---[ \t]*\n[\s\S]*?\n---[ \t]*\n/
+
+function stripFrontmatter(content: string): string {
+  return content.replace(FRONTMATTER_RE, '')
+}
+
+function parseFrontmatterField(content: string, field: string): string | null {
+  const fm = content.match(FRONTMATTER_RE)
+  if (!fm) return null
+  const line = fm[0].match(new RegExp(`^${field}:[ \\t]*(.+)$`, 'm'))
+  if (!line) return null
+  const value = line[1].trim().replace(/^["']|["']$/g, '')
+  return value ? decodeUnicodeEscapes(value) : null
+}
+
+function extractLeadingH1(body: string): { heading: string | null; rest: string } {
+  const trimmed = body.replace(/^\s+/, '')
+  const match = trimmed.match(/^#\s+(.+)\n?/)
+  if (!match) return { heading: null, rest: body }
+  return { heading: match[1].replace(/\*\*/g, '').trim(), rest: trimmed.slice(match[0].length) }
+}
+
+function humanizeSegment(segment: string): string {
+  const text = segment.replace(/\.(md|txt|json)$/i, '').replace(/[-_]/g, ' ').trim()
+  return text === text.toLowerCase() ? text.replace(/\b\w/g, (c) => c.toUpperCase()) : text
+}
+
+// Folder breadcrumb above the title, e.g. "concepts/policy.md" -> "Concepts".
+function pathEyebrow(path: string | undefined): string | null {
+  if (!path) return null
+  const parts = path.replace(/^\/+/, '').split('/').filter(Boolean)
+  parts.pop()
+  if (parts.length === 0) return null
+  return parts.map(humanizeSegment).join(' · ')
+}
+
+interface MdastLike {
+  type: string
+  value?: string
+  children?: MdastLike[]
+}
+
+// remark-math only parses $ delimiters; markdown would eat \( \) and \[ \] as escapes.
+function normalizeMathDelimiters(md: string): string {
+  const segments = md.split(/(```[\s\S]*?(?:```|$)|~~~[\s\S]*?(?:~~~|$)|`[^`\n]*`)/)
+  return segments
+    .map((segment, i) => {
+      if (i % 2 === 1) return segment
+      const converted = segment
+        .replace(/\\\[([\s\S]+?)\\\]/g, (_, inner: string) => `$$${inner}$$`)
+        // Fork: $$ (not $) — single-dollar text math is disabled, see REMARK_PLUGINS.
+        .replace(/\\\((.+?)\\\)/g, (_, inner: string) => `$$${inner.trim()}$$`)
+      return escapeCurrencyDollars(converted)
+    })
+    .join('')
+}
+
+// $ followed by a digit is currency ("$100M ... $10M") unless the span to its closing $ contains LaTeX syntax.
+const MATH_SYNTAX = /[\\^_{}=+]/
+
+function escapeCurrencyDollars(text: string): string {
+  let out = ''
+  let i = 0
+  while (i < text.length) {
+    const ch = text[i]
+    if (ch === '\\' && text[i + 1] === '$') {
+      out += '\\$'
+      i += 2
+      continue
+    }
+    if (ch !== '$') {
+      out += ch
+      i++
+      continue
+    }
+    if (text[i + 1] === '$') {
+      const close = text.indexOf('$$', i + 2)
+      const end = close === -1 ? text.length : close + 2
+      out += text.slice(i, end)
+      i = end
+      continue
+    }
+    if (!/\d/.test(text[i + 1] ?? '')) {
+      out += ch
+      i++
+      continue
+    }
+    const paragraphEnd = text.indexOf('\n\n', i)
+    const searchEnd = paragraphEnd === -1 ? text.length : paragraphEnd
+    const close = text.indexOf('$', i + 1)
+    const isMath = close !== -1 && close < searchEnd && MATH_SYNTAX.test(text.slice(i + 1, close))
+    out += isMath ? ch : '\\$'
+    i++
+  }
+  return out
+}
+
+// Tools double-escape commands (\\log); real \\ breaks never precede a letter. Bare % would start a LaTeX comment.
+function remarkFixOverescapedMath() {
+  const restore = (node: MdastLike): void => {
+    if ((node.type === 'inlineMath' || node.type === 'math') && typeof node.value === 'string') {
+      node.value = node.value
+        .replace(/\\\\(?=[a-zA-Z])/g, '\\')
+        .replace(/\\%|%/g, (m) => (m === '%' ? '\\%' : m))
+    }
+    node.children?.forEach(restore)
+  }
+  return restore
+}
+
+interface TaskListItem extends MdastLike {
+  checked?: boolean | null
+  data?: { hProperties?: Record<string, unknown> }
+}
+
+const EXTENDED_TASK_MARKER_RE = /^\[([~!])\](?:[ \t]+|$)/
+
+// remark-gfm only parses [ ]/[x]; this adds the plan convention's [~] in-progress and [!] blocked.
+export function remarkTaskStatus() {
+  const visit = (node: TaskListItem): void => {
+    if (node.type === 'listItem') {
+      let status: TaskStatus | null = null
+      if (node.checked === true) status = 'done'
+      else if (node.checked === false) status = 'todo'
+      else {
+        const paragraph = node.children?.[0]
+        const text = paragraph?.type === 'paragraph' ? paragraph.children?.[0] : undefined
+        if (text?.type === 'text' && typeof text.value === 'string') {
+          const marker = text.value.match(EXTENDED_TASK_MARKER_RE)
+          if (marker) {
+            status = marker[1] === '~' ? 'in_progress' : 'blocked'
+            text.value = text.value.slice(marker[0].length)
+          }
+        }
+      }
+      if (status) {
+        node.data = node.data ?? {}
+        node.data.hProperties = { ...node.data.hProperties, 'data-task': status }
+      }
+    }
+    node.children?.forEach(visit)
+  }
+  return visit
+}
+
+function TaskGlyph({ status }: { status: string }) {
+  if (status === 'done') return <Check className="size-3.5 text-emerald-500" />
+  if (status === 'in_progress') return <span className="size-1.5 rounded-full bg-foreground" />
+  if (status === 'blocked') return <CircleAlert className="size-3.5 text-amber-500" />
+  return <span className="size-2.5 rounded-full border border-border" />
+}
+
+function PlanProgressHeader({ summary }: { summary: PlanSummary }) {
+  return (
+    <div className="mb-8">
+      <div className="flex items-center gap-3">
+        <div className="h-1 flex-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full bg-foreground/30 transition-[width]"
+            style={{ width: `${Math.round((summary.done / summary.total) * 100)}%` }}
+          />
+        </div>
+        <span className="text-[11px] text-muted-foreground/50 tabular-nums">
+          {summary.done}/{summary.total}
+        </span>
+      </div>
+      <div className="mt-3 space-y-1">
+        {summary.stages.map((stage, index) => (
+          <div key={index} className="flex items-baseline justify-between gap-4 text-xs">
+            <span className="min-w-0 truncate text-muted-foreground">{stage.title || 'Tasks'}</span>
+            <span className="shrink-0 tabular-nums text-muted-foreground/60">
+              {stage.done}/{stage.total}
+              {stage.counts.blocked > 0 && (
+                <span className="text-amber-500"> · {stage.counts.blocked} blocked</span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function TableOfContents({ items }: { items: TocItem[] }) {
-  const [activeId, setActiveId] = React.useState<string | null>(null)
+  const [activeIndex, setActiveIndex] = React.useState(0)
 
+  // Content scrolls in a nested div, so a viewport IntersectionObserver never fires.
   React.useEffect(() => {
     if (items.length === 0) return
-
-    const observer = new IntersectionObserver(
-      (entries) => {
-        // Find the first visible heading
-        const visible = entries.filter((e) => e.isIntersecting)
-        if (visible.length > 0) {
-          setActiveId(visible[0].target.id)
-        }
-      },
-      { rootMargin: '-80px 0px -70% 0px', threshold: 0 },
-    )
-
-    // Small delay to ensure headings are rendered
-    const timeout = setTimeout(() => {
-      for (const item of items) {
+    const container = document.getElementById('wiki-scroll-container')
+    if (!container) return
+    const update = () => {
+      const top = container.getBoundingClientRect().top
+      let current = 0
+      items.forEach((item, i) => {
         const el = document.getElementById(item.id)
-        if (el) observer.observe(el)
-      }
-    }, 100)
-
+        if (el && el.getBoundingClientRect().top - top < 120) current = i
+      })
+      setActiveIndex(current)
+    }
+    const raf = requestAnimationFrame(update)
+    container.addEventListener('scroll', update, { passive: true })
     return () => {
-      clearTimeout(timeout)
-      observer.disconnect()
+      cancelAnimationFrame(raf)
+      container.removeEventListener('scroll', update)
     }
   }, [items])
 
   if (items.length === 0) return null
 
   return (
-    <nav className="space-y-0.5">
-      <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/50 mb-2 px-1">
+    <nav>
+      <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/50 mb-3 px-1">
         On this page
       </p>
-      {items.map((item) => (
-        <a
-          key={item.id}
-          href={`#${item.id}`}
-          onClick={(e) => {
-            e.preventDefault()
-            const el = document.getElementById(item.id)
-            if (el) {
-              el.scrollIntoView({ behavior: 'smooth', block: 'start' })
-              setActiveId(item.id)
-            }
-          }}
-          className={cn(
-            'block text-xs leading-snug py-1 px-1 rounded transition-colors',
-            item.level === 3 && 'pl-4',
-            activeId === item.id
-              ? 'text-foreground font-medium'
-              : 'text-muted-foreground/60 hover:text-muted-foreground',
-          )}
-        >
-          {item.text}
-        </a>
-      ))}
+      <div className="relative">
+        <div className="absolute left-[3px] top-1.5 bottom-1.5 w-px bg-border" aria-hidden />
+        {items.map((item, i) => {
+          const state = i < activeIndex ? 'read' : i === activeIndex ? 'current' : 'upcoming'
+          return (
+            <a
+              key={item.id}
+              href={`#${item.id}`}
+              onClick={(e) => {
+                e.preventDefault()
+                document.getElementById(item.id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+              }}
+              className={cn(
+                'relative flex items-start py-1 text-xs leading-snug transition-colors',
+                item.level === 3 ? 'pl-6' : 'pl-4',
+                state === 'current'
+                  ? 'text-foreground font-medium'
+                  : state === 'read'
+                    ? 'text-muted-foreground hover:text-foreground'
+                    : 'text-muted-foreground/50 hover:text-muted-foreground',
+              )}
+            >
+              <span
+                aria-hidden
+                className={cn(
+                  'absolute left-0 top-[7px] size-[7px] rounded-full ring-2 ring-background transition-colors',
+                  state === 'current'
+                    ? 'bg-foreground'
+                    : state === 'read'
+                      ? 'bg-muted-foreground/50'
+                      : 'bg-border',
+                )}
+              />
+              <span className="min-w-0">{item.text}</span>
+            </a>
+          )
+        })}
+      </div>
     </nav>
   )
 }
 
 function parseFootnoteSources(content: string): Map<string, string> {
   const map = new Map<string, string>()
-  // Match footnote definitions: [^1]: full source text until end of line
   const regex = /\[\^(\d+)\]:\s*(.+)$/gm
   let m
   while ((m = regex.exec(content)) !== null) {
     const num = m[1]
     let source = m[2].trim()
-    // Strip surrounding bold markers
     source = source.replace(/^\*{1,2}/, '').replace(/\*{1,2}$/, '')
-    // Clean up markdown links
     const linkMatch = source.match(/\[([^\]]+)\]\([^)]*\)/)
     if (linkMatch) source = linkMatch[1]
     map.set(num, source)
@@ -192,7 +464,6 @@ function CitationBadge({
     }
   }, [])
 
-  // Parse source into filename and page reference
   const parts = source.match(/^(.+?)(?:,\s*p\.?\s*(.+))?$/)
   const filename = parts?.[1]?.trim() ?? source
   const pageRef = parts?.[2]?.trim()
@@ -252,13 +523,11 @@ function CitationBadge({
 function WikiImage({
   src,
   alt,
-  documents,
-  wikiActivePath,
+  documentsRef,
 }: {
   src?: string
   alt?: string
-  documents?: DocumentListItem[]
-  wikiActivePath?: string
+  documentsRef: React.RefObject<DocumentListItem[] | undefined>
 }) {
   const token = useUserStore((s) => s.accessToken)
   const [svgContent, setSvgContent] = React.useState<string | null>(null)
@@ -266,12 +535,16 @@ function WikiImage({
   const [loading, setLoading] = React.useState(false)
 
   React.useEffect(() => {
+    // Stable renderer identities mean this instance is reused across page navigations.
+    setSvgContent(null)
+    setImageUrl(null)
+    setLoading(false)
+
+    const documents = documentsRef.current
     if (!src || !documents || !token) return
-    // Only resolve relative paths (not http:// or data: URIs)
     if (src.startsWith('http') || src.startsWith('data:')) return
 
-    // Resolve relative path: strip leading ./ and resolve against current wiki path
-    let filename = src.replace(/^\.\//, '')
+    const filename = src.replace(/^\.\//, '')
     const doc = documents.find((d) => {
       return d.filename === filename || d.filename === filename.split('/').pop()
     })
@@ -281,35 +554,42 @@ function WikiImage({
     const isSvg = doc.file_type === 'svg'
     const isTextAsset = ['svg', 'csv', 'xml', 'html'].includes(doc.file_type)
     const isImageBinary = ['png', 'jpg', 'jpeg', 'webp', 'gif'].includes(doc.file_type)
+    if (!isTextAsset && !isImageBinary) return
 
+    let cancelled = false
     setLoading(true)
 
     if (isSvg || isTextAsset) {
-      // Text-based assets stored in the content column — fetch via API
       apiFetch<{ content: string }>(`/v1/documents/${doc.id}/content`, token)
         .then((res) => {
+          if (cancelled) return
           if (isSvg && res.content) {
             setSvgContent(res.content)
           } else if (res.content) {
-            // For non-SVG text assets, render as data URI
             const blob = new Blob([res.content], { type: `image/${doc.file_type}+xml` })
             setImageUrl(URL.createObjectURL(blob))
           }
         })
-        .catch(() => { /* silent fail — image just won't render */ })
-        .finally(() => setLoading(false))
-    } else if (isImageBinary) {
-      // Binary images stored in S3 — use the /url endpoint
-      apiFetch<{ url: string }>(`/v1/documents/${doc.id}/url`, token)
-        .then((res) => setImageUrl(res.url))
-        .catch(() => { /* silent fail */ })
-        .finally(() => setLoading(false))
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
     } else {
-      setLoading(false)
+      apiFetch<{ url: string }>(`/v1/documents/${doc.id}/url`, token)
+        .then((res) => {
+          if (!cancelled) setImageUrl(res.url)
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (!cancelled) setLoading(false)
+        })
     }
-  }, [src, documents, token, wikiActivePath])
 
-  // Inline SVG rendering
+    return () => {
+      cancelled = true
+    }
+  }, [src, documentsRef, token])
+
   if (svgContent) {
     const dataUri = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svgContent)}`
     return (
@@ -324,7 +604,6 @@ function WikiImage({
     )
   }
 
-  // Resolved image URL (binary or data URI)
   if (imageUrl) {
     return (
       <ExpandableMedia content={imageUrl} type="img" alt={alt}>
@@ -338,7 +617,7 @@ function WikiImage({
     )
   }
 
-  // Still loading — use span to avoid div-inside-p hydration error
+  // span, not div: images render inside <p> and a div would break hydration.
   if (loading) {
     return (
       <span className="block my-5 flex justify-center">
@@ -347,7 +626,6 @@ function WikiImage({
     )
   }
 
-  // Fallback: render as a normal image tag (external URLs, unresolved paths)
   return (
     // eslint-disable-next-line @next/next/no-img-element
     <img
@@ -358,23 +636,87 @@ function WikiImage({
   )
 }
 
+// Memoized: KaTeX parsing is expensive and documents churn over the websocket.
+const MarkdownBody = React.memo(function MarkdownBody({
+  content,
+  components,
+}: {
+  content: string
+  components: Components
+}) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={REHYPE_PLUGINS}
+      components={components}
+    >
+      {content}
+    </ReactMarkdown>
+  )
+})
+
 interface WikiContentProps {
   content: string
   title: string
+  path?: string
+  documentId?: string | null
   onNavigate: (path: string) => void
   onSourceClick?: (filename: string, page?: number) => void
   onGraphClick?: () => void
   documents?: DocumentListItem[]
+  courseMode?: boolean
+  courseView?: 'overview' | 'lesson' | null
+  isComplete?: boolean
+  prevLesson?: LessonLink | null
+  forwardLabel?: string | null
+  onForward?: () => void
+  resumeLesson?: LessonLink | null
+  onLessonNavigate?: (path: string) => void
+  lessonsTotal?: number
+  lessonsComplete?: number
+  prevPage?: LessonLink | null
+  nextPage?: LessonLink | null
+  onDelete?: (() => void) | null
 }
 
-export function WikiContent({ content, title, onNavigate, onSourceClick, onGraphClick, documents }: WikiContentProps) {
-  const processedContent = React.useMemo(() => stripLeadingH1(content, title), [content, title])
+interface LessonLink {
+  title: string
+  path: string
+}
+
+export function WikiContent({ content, title, path, documentId = null, onNavigate, onSourceClick, onGraphClick, documents, courseMode = false, courseView = null, isComplete = false, prevLesson = null, forwardLabel = null, onForward, resumeLesson = null, onLessonNavigate, lessonsTotal = 0, lessonsComplete = 0, prevPage = null, nextPage = null, onDelete = null }: WikiContentProps) {
+  const scrollRef = React.useRef<HTMLDivElement | null>(null)
+  const markdownRef = React.useRef<HTMLDivElement | null>(null)
+  const remoteVersion = documents?.find((d) => d.id === documentId)?.version ?? null
+  const highlightsApi = useWikiHighlights(documentId, remoteVersion)
+
+  // New renderer functions are new element types to React, remounting the whole page; hence refs.
+  const onNavigateRef = React.useRef(onNavigate)
+  onNavigateRef.current = onNavigate
+  const onSourceClickRef = React.useRef(onSourceClick)
+  onSourceClickRef.current = onSourceClick
+  const documentsRef = React.useRef(documents)
+  documentsRef.current = documents
+  const documentIdRef = React.useRef(documentId)
+  documentIdRef.current = documentId
+
+  const body = React.useMemo(() => stripFrontmatter(content), [content])
+  const description = React.useMemo(() => parseFrontmatterField(content, 'description'), [content])
+  const { heading, rest } = React.useMemo(() => extractLeadingH1(body), [body])
+  const processedContent = React.useMemo(
+    () => normalizeMathDelimiters(stripLegacyQuizWrapper(rest)),
+    [rest],
+  )
+  const pageTitle = toDisplayTitle(decodeUnicodeEscapes(heading ?? title))
+  const eyebrow = React.useMemo(() => pathEyebrow(path), [path])
   const tocItems = React.useMemo(() => extractTocFromMarkdown(processedContent), [processedContent])
   const footnoteSources = React.useMemo(() => parseFootnoteSources(processedContent), [processedContent])
+  const isPlanPage = path === 'plan.md'
+  const planSummary = React.useMemo(
+    () => (isPlanPage ? parsePlanTasks(processedContent) : null),
+    [isPlanPage, processedContent],
+  )
   const [copied, setCopied] = React.useState(false)
-  // Fresh slugger per render so duplicate headings get the same -1/-2 suffixes as the TOC.
-  const slugRef = React.useRef(createSlugger())
-  slugRef.current = createSlugger()
 
   const handleCopy = React.useCallback(() => {
     navigator.clipboard.writeText(content).then(() => {
@@ -383,49 +725,36 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
     })
   }, [content])
 
-  const handleDownload = React.useCallback(() => {
-    const filename = title ? `${title.replace(/[^\w\s-]/g, '').replace(/\s+/g, '-').toLowerCase()}.md` : 'page.md'
-    const blob = new Blob([content], { type: 'text/markdown' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = filename
-    a.click()
-    URL.revokeObjectURL(url)
-  }, [content, title])
-
   const components: Components = React.useMemo(
     () => ({
-      h1({ children }) {
+      h1({ children, id }) {
         const text = childrenToText(children)
-        const id = slugRef.current(text)
         return (
           <h1 id={id} className="text-2xl font-bold tracking-tight mt-8 mb-3 first:mt-0 scroll-mt-20">
             {children}
           </h1>
         )
       },
-      h2({ children }) {
+      h2({ children, id }) {
         const text = childrenToText(children)
-        const id = slugRef.current(text)
+        const displayText = displayHeadingText(text)
         return (
           <h2 id={id} className="text-xl font-semibold tracking-tight mt-6 mb-2 pt-2 border-t border-border/50 first:border-0 first:pt-0 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h2>
         )
       },
-      h3({ children }) {
+      h3({ children, id }) {
         const text = childrenToText(children)
-        const id = slugRef.current(text)
+        const displayText = displayHeadingText(text)
         return (
           <h3 id={id} className="text-lg font-medium tracking-tight mt-6 mb-1.5 scroll-mt-20">
-            {children}
+            {displayText === text ? children : displayText}
           </h3>
         )
       },
-      h4({ children }) {
+      h4({ children, id }) {
         const text = childrenToText(children)
-        const id = slugRef.current(text)
         return (
           <h4 id={id} className="text-base font-medium mt-5 mb-1 scroll-mt-20">
             {children}
@@ -437,19 +766,18 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
       },
       pre({ children, ...props }) {
         const child = React.Children.toArray(children)[0]
-        if (
-          React.isValidElement(child) &&
-          typeof child.props === 'object' &&
-          child.props !== null &&
-          'className' in child.props &&
-          typeof child.props.className === 'string' &&
-          child.props.className.includes('language-mermaid')
-        ) {
-          const text =
-            'children' in child.props
-              ? String(child.props.children).replace(/\n$/, '')
-              : ''
-          return <MermaidBlock chart={text} />
+        const fence = fenceInfo(child)
+        if (fence?.language === 'mermaid') {
+          return <MermaidBlock chart={fence.text} />
+        }
+        if (fence?.language === 'quiz') {
+          return (
+            <QuizBlock
+              source={fence.text}
+              documentId={documentIdRef.current}
+              documentsRef={documentsRef}
+            />
+          )
         }
         return (
           <pre
@@ -479,7 +807,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         )
       },
       a({ href, children }) {
-        // Footnote back-references (↩ arrows) — hide entirely
+        // Hide footnote back-references (↩).
         if (href?.includes('fnref')) {
           return null
         }
@@ -498,7 +826,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
           )
         }
 
-        // Internal wiki links
         if (
           href &&
           !href.startsWith('http') &&
@@ -507,7 +834,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         ) {
           return (
             <button
-              onClick={() => onNavigate(href)}
+              onClick={() => onNavigateRef.current(href)}
               className="text-accent-blue underline underline-offset-2 decoration-accent-blue/30 hover:decoration-accent-blue transition-colors cursor-pointer font-medium"
             >
               {children}
@@ -515,7 +842,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
           )
         }
 
-        // Anchor links (headings)
         if (href?.startsWith('#')) {
           return (
             <a
@@ -545,7 +871,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         )
       },
       sup({ children, ...props }) {
-        // Detect footnote references like [^1] which render as <sup> with an <a> inside
         const child = React.Children.toArray(children)[0]
         const childProps = React.isValidElement(child) ? (child.props as Record<string, unknown>) : null
         const childHref = childProps && typeof childProps.href === 'string' ? childProps.href : null
@@ -560,7 +885,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
                   num={num}
                   source={source}
                   onSourceClick={(filename, page) => {
-                    if (onSourceClick) onSourceClick(filename, page)
+                    onSourceClickRef.current?.(filename, page)
                   }}
                 />
               </sup>
@@ -627,7 +952,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         )
       },
       li({ children, ...props }) {
-        // Style footnote list items (inside <section data-footnotes>)
         const id = (props as Record<string, unknown>).id
         if (typeof id === 'string' && (id.startsWith('fn-') || id.startsWith('user-content-fn-'))) {
           const text = childrenToText(children).replace(/↩.*$/, '').trim()
@@ -637,11 +961,23 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
               className="my-2 text-sm pl-1 scroll-mt-20"
             >
               <button
-                onClick={() => onSourceClick?.(text)}
+                onClick={() => onSourceClickRef.current?.(text)}
                 className="text-muted-foreground hover:text-foreground hover:underline transition-colors cursor-pointer text-left"
               >
                 {text}
               </button>
+            </li>
+          )
+        }
+        const dp = props as Record<string, unknown>
+        const task = dp['data-task'] ?? dp.dataTask
+        if (typeof task === 'string') {
+          return (
+            <li data-task={task} className="my-1 flex list-none items-start gap-2 leading-[1.65]">
+              <span className="mt-[5px] flex size-3.5 shrink-0 items-center justify-center">
+                <TaskGlyph status={task} />
+              </span>
+              <div className="min-w-0 flex-1">{children}</div>
             </li>
           )
         }
@@ -651,6 +987,10 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
           </li>
         )
       },
+      input(props) {
+        if (props.type === 'checkbox') return null
+        return <input {...props} />
+      },
       hr() {
         return <hr className="my-6 border-border/60" />
       },
@@ -659,15 +999,14 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
           <WikiImage
             src={typeof src === 'string' ? src : undefined}
             alt={typeof alt === 'string' ? alt : undefined}
-            documents={documents}
+            documentsRef={documentsRef}
           />
         )
       },
       section({ children, ...props }) {
-        // Replace the auto-generated footnotes section with our own clean version
+        // Replace remark-gfm's footnotes section with one built from parsed sources.
         const dp = props as Record<string, unknown>
         if (dp['data-footnotes'] !== undefined || dp.dataFootnotes !== undefined || dp.className === 'footnotes') {
-          // Render our own clean footnotes from parsed sources
           const entries = Array.from(footnoteSources.entries())
           if (entries.length === 0) return null
           return (
@@ -681,7 +1020,7 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
                   return (
                     <li key={num} className="text-sm pl-1">
                       <button
-                        onClick={() => onSourceClick?.(filename)}
+                        onClick={() => onSourceClickRef.current?.(filename)}
                         className="text-muted-foreground hover:text-foreground hover:underline transition-colors cursor-pointer text-left"
                       >
                         {source}
@@ -696,13 +1035,13 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         return <section {...props}>{children}</section>
       },
     }),
-    [onNavigate, onSourceClick, footnoteSources, documents],
+    [footnoteSources],
   )
 
   const hasToc = tocItems.length > 0
 
   return (
-    <div className="h-full overflow-y-auto" id="wiki-scroll-container">
+    <div className="relative h-full overflow-y-auto" id="wiki-scroll-container" ref={scrollRef}>
       <div className={cn(
         'mx-auto px-6 py-10',
         hasToc ? 'max-w-5xl' : 'max-w-3xl',
@@ -710,14 +1049,20 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
         <div className={cn(
           hasToc && 'flex gap-8',
         )}>
-          {/* Main content */}
           <div className={cn(
             'min-w-0',
             hasToc ? 'flex-1 max-w-[720px]' : 'w-full',
           )}>
-            {title && (
-              <div className="flex items-start justify-between gap-4 mb-2">
-                <h1 className="text-3xl font-bold tracking-tight">{title}</h1>
+            <div className="mb-6">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  {eyebrow && (
+                    <div className="text-[11px] font-medium uppercase tracking-[0.06em] text-muted-foreground/60 mb-2">
+                      {eyebrow}
+                    </div>
+                  )}
+                  {pageTitle && <h1 className="text-3xl font-bold tracking-tight">{pageTitle}</h1>}
+                </div>
                 <div className="flex items-center gap-1 shrink-0 mt-1.5">
                   <button
                     onClick={handleCopy}
@@ -726,13 +1071,6 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
                   >
                     {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}
                   </button>
-                  {/* <button
-                    onClick={handleDownload}
-                    className="p-1.5 rounded-md text-muted-foreground/40 hover:text-muted-foreground hover:bg-accent transition-colors cursor-pointer"
-                    title="Download as .md"
-                  >
-                    <Download className="size-3.5" />
-                  </button> */}
                   {onGraphClick && (
                     <button
                       onClick={onGraphClick}
@@ -742,21 +1080,111 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
                       <Network className="size-3.5" />
                     </button>
                   )}
+                  {onDelete && (
+                    <button
+                      onClick={onDelete}
+                      className="p-1.5 rounded-md text-muted-foreground/40 hover:text-destructive hover:bg-accent transition-colors cursor-pointer"
+                      title="Delete page"
+                    >
+                      <Trash2 className="size-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
-            )}
-            <div className="wiki-content text-[15px] leading-relaxed">
-              <ReactMarkdown
-                remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }]]}
-                rehypePlugins={[rehypeKatex]}
-                components={components}
-              >
-                {processedContent}
-              </ReactMarkdown>
+              {description && (
+                <p className="text-[15px] text-muted-foreground mt-2.5 leading-relaxed">{description}</p>
+              )}
             </div>
+            {planSummary && planSummary.total > 0 && <PlanProgressHeader summary={planSummary} />}
+            <div className="wiki-content text-[15px] leading-relaxed" ref={markdownRef}>
+              <MarkdownBody
+                key={documentId ?? 'unpersisted'}
+                content={processedContent}
+                components={components}
+              />
+            </div>
+            <WikiComments highlights={highlightsApi.highlights} contentRef={markdownRef} />
+            {!courseMode && (prevPage || nextPage) && (
+              <div className="mt-12 pt-5 border-t border-border flex items-center justify-between gap-4">
+                {prevPage ? (
+                  <button
+                    onClick={() => onNavigate(prevPage.path)}
+                    className="flex items-center gap-1.5 min-w-0 text-[13px] text-muted-foreground/60 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Previous: ${prevPage.title}`}
+                  >
+                    <ChevronLeft className="size-4 shrink-0" />
+                    <span className="truncate max-w-[220px]">{prevPage.title}</span>
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+                {nextPage ? (
+                  <button
+                    onClick={() => onNavigate(nextPage.path)}
+                    className="flex items-center justify-end gap-1.5 min-w-0 text-[13px] font-medium text-foreground/80 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Next: ${nextPage.title}`}
+                  >
+                    <span className="truncate max-w-[220px]">{nextPage.title}</span>
+                    <ChevronRight className="size-4 shrink-0" />
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+              </div>
+            )}
+            {courseMode && courseView === 'overview' && resumeLesson && (
+              <div className="mt-12 pt-6 border-t border-border flex items-center justify-between gap-4">
+                <div className="text-[13px] text-muted-foreground">
+                  {lessonsComplete > 0
+                    ? `${lessonsComplete} of ${lessonsTotal} lessons complete`
+                    : `${lessonsTotal} ${lessonsTotal === 1 ? 'lesson' : 'lessons'}`}
+                </div>
+                <button
+                  onClick={() => onLessonNavigate?.(resumeLesson.path)}
+                  className="inline-flex items-center gap-2 rounded-md bg-foreground text-background font-semibold text-[13px] px-4 py-2 hover:opacity-90 transition-opacity cursor-pointer"
+                >
+                  {lessonsTotal > 0 && lessonsComplete >= lessonsTotal ? 'Review course' : lessonsComplete > 0 ? 'Continue' : 'Start course'}
+                  <ArrowRight className="size-4" />
+                </button>
+              </div>
+            )}
+            {courseMode && courseView === 'lesson' && (
+              <div className="mt-12 pt-5 border-t border-border flex items-center justify-between gap-4">
+                {prevLesson ? (
+                  <button
+                    onClick={() => onLessonNavigate?.(prevLesson.path)}
+                    className="flex items-center gap-1.5 min-w-0 text-[13px] text-muted-foreground/60 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Previous: ${prevLesson.title}`}
+                  >
+                    <ChevronLeft className="size-4 shrink-0" />
+                    <span className="truncate max-w-[160px]">{prevLesson.title}</span>
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+                {isComplete ? (
+                  <span className="inline-flex items-center gap-1.5 text-[13px] font-medium text-emerald-600 dark:text-emerald-400">
+                    <Check className="size-3.5" />Completed
+                  </span>
+                ) : (
+                  <span />
+                )}
+                {forwardLabel ? (
+                  <button
+                    onClick={onForward}
+                    className="flex items-center justify-end gap-1.5 min-w-0 text-[13px] font-medium text-foreground/80 hover:text-foreground transition-colors cursor-pointer"
+                    title={`Next: ${forwardLabel}`}
+                  >
+                    <span className="truncate max-w-[160px]">{forwardLabel}</span>
+                    <ChevronRight className="size-4 shrink-0" />
+                  </button>
+                ) : (
+                  <span className="w-6" />
+                )}
+              </div>
+            )}
           </div>
 
-          {/* Right sidebar — "On this page" ToC */}
           {hasToc && (
             <aside className="hidden lg:block w-48 shrink-0">
               <div className="sticky top-10">
@@ -766,6 +1194,15 @@ export function WikiContent({ content, title, onNavigate, onSourceClick, onGraph
           )}
         </div>
       </div>
+      {documentId && (
+        <WikiHighlighter
+          scrollRef={scrollRef}
+          contentRef={markdownRef}
+          documentId={documentId}
+          contentKey={processedContent}
+          api={highlightsApi}
+        />
+      )}
     </div>
   )
 }
