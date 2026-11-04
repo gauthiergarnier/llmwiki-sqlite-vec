@@ -8,7 +8,10 @@ from vaultfs import VaultFS
 logger = logging.getLogger(__name__)
 
 # Footnote labels may be numeric ([^1]) or alphanumeric ([^a1], [^DIHK]).
-_CITATION_RE = re.compile(r"\[\^[^\]]+\]:\s*(.+)$", re.MULTILINE)
+# Use [ \t]* rather than \s*: \s matches newlines, so an *inline* footnote
+# reference ending a line before a colon -- "**Mechanics agreed**[^smurfit]:" --
+# would consume the newline and read the FOLLOWING line as the citation target.
+_CITATION_RE = re.compile(r"\[\^[^\]]+\]:[ \t]*(.+)$", re.MULTILINE)
 _WIKI_LINK_RE = re.compile(r"(?<!!)\[(?:[^\]]*)\]\(([^)]+)\)")
 
 _KNOWN_EXT = r"(?:pdf|docx?|pptx?|xlsx?|csv|html?|md|txt|png|jpe?g|gif|webp|svg|canvas)"
