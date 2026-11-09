@@ -42,6 +42,12 @@ VEC_TABLE_DDL = (
 
 _BATCH = 64
 _BUSY_TIMEOUT_MS = 60_000
+_LOCK_RETRY_S = 15.0
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
 
 
 # ── Extension loading ──────────────────────────────────────────────────────
@@ -168,15 +174,25 @@ class _VectorSyncer:
         self.task = self.loop.create_task(self._run(), name="chunk-vector-sync")
 
     async def _run(self) -> None:
+        timeout = self.interval
         while True:
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self.wake.wait(), timeout=self.interval)
+                await asyncio.wait_for(self.wake.wait(), timeout=timeout)
             await asyncio.sleep(self.debounce)  # coalesce bursts of writes
             self.wake.clear()
+            timeout = self.interval
             try:
                 await asyncio.to_thread(sync_chunk_vectors, self.db_path)
             except asyncio.CancelledError:
                 raise
+            except sqlite3.OperationalError as e:
+                if not _is_lock_error(e):
+                    logger.warning("Vector sync failed; will retry", exc_info=True)
+                    continue
+                # Expected while another process holds a long write (e.g. `llmwiki reindex`
+                # inserting every document in one transaction): retry soon, quietly.
+                logger.warning("Vector sync: index busy (%s); retrying in %.0fs", e, _LOCK_RETRY_S)
+                timeout = _LOCK_RETRY_S
             except Exception:
                 logger.warning("Vector sync failed; will retry", exc_info=True)
 

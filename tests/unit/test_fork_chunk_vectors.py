@@ -126,3 +126,35 @@ def test_start_respects_disable_switch(monkeypatch, db_path):
         assert chunk_vectors._syncer is None
 
     asyncio.run(run())
+
+
+def test_syncer_retries_soon_and_quietly_when_index_is_locked(monkeypatch, caplog):
+    """A long writer (e.g. `llmwiki reindex`) must not cost a traceback or a 5-minute wait."""
+    import asyncio
+    import logging
+
+    calls = []
+
+    def fake_sync(db_path, **_):
+        calls.append(db_path)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return {"removed": 0, "embedded": 0, "total_chunks": 0, "enabled": True}
+
+    monkeypatch.setattr(chunk_vectors, "sync_chunk_vectors", fake_sync)
+    monkeypatch.setattr(chunk_vectors, "_LOCK_RETRY_S", 0.05)
+
+    async def run():
+        syncer = chunk_vectors._VectorSyncer("x.db", debounce=0, interval=3600)
+        for _ in range(100):
+            if len(calls) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        syncer.task.cancel()
+
+    with caplog.at_level(logging.WARNING, logger=chunk_vectors.logger.name):
+        asyncio.run(run())
+
+    assert len(calls) == 2  # retried well before the 3600s sweep
+    busy = [r for r in caplog.records if "index busy" in r.getMessage()]
+    assert len(busy) == 1 and busy[0].exc_info is None
